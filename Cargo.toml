@@ -1,0 +1,15 @@
+[package]
+name = "snarkos_network_testing"
+version = "0.1.0"
+authors = ["ljedrz <ljedrz@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+pea2pea = { git = "https://github.com/ljedrz/pea2pea" }
+snarkos-network = { git = "https://github.com/niklaslong/snarkOS", branch = "refactor/networking" }
+
+async-trait = "0.1"
+chrono = "0.4"
+tokio = { version = "0.3", features = ["io-util", "macros", "net", "parking_lot", "rt-multi-thread", "sync"] }
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.2", features = ["ansi", "chrono", "env-filter", "fmt", "parking_lot", "smallvec"] }
