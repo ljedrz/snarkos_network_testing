@@ -1,11 +1,11 @@
 use chrono::Utc;
-use tokio::{io::AsyncReadExt, task::JoinHandle, time::sleep};
+use tokio::{io::AsyncReadExt, task::JoinHandle};
 use tracing::*;
 
 use pea2pea::*;
 use snarkos_network::external::{GetPeers, Message, MessageHeader, Peers, Verack, Version};
 
-use std::{fmt, io, net::SocketAddr, ops::Deref, sync::Arc, time::Duration};
+use std::{fmt, io, net::SocketAddr, ops::Deref, sync::Arc};
 
 #[derive(Clone)]
 pub struct FakeNode {
@@ -318,33 +318,31 @@ impl HandshakeProtocol for FakeNode {
     }
 }
 
+#[async_trait::async_trait]
 impl BroadcastProtocol for FakeNode {
     const INTERVAL_MS: u64 = 10_000;
 
-    fn enable_broadcast_protocol(&self) {
-        let node = self.clone();
-        tokio::spawn(async move {
-            loop {
-                info!(parent: node.span(), "broadcasting Version");
+    async fn perform_broadcast(&self) -> io::Result<()> {
+        let node = self.node();
 
-                let block_height = 1; // TODO: keep a state that updates based on the highest received value
-                let nonce = node.listening_addr.port() as u64; // for simplicity
+        info!(parent: node.span(), "broadcasting Version");
 
-                // provide the discard protocol as the port on the receiver side
-                // TODO: check if that value is not already ignored by snarkOS (it's probable)
-                let version = Version::new(
-                    VERSION,
-                    block_height,
-                    nonce,
-                    node.listening_addr,
-                    "127.0.0.1:9".parse().unwrap(),
-                );
-                let packeted = prepare_packet(&version);
+        let block_height = 1; // TODO: keep a state that updates based on the highest received value
+        let nonce = node.listening_addr.port() as u64; // for simplicity
 
-                node.send_broadcast(packeted).await;
+        // provide the discard protocol as the port on the receiver side
+        // TODO: check if that value is not already ignored by snarkOS (it's probable)
+        let version = Version::new(
+            VERSION,
+            block_height,
+            nonce,
+            node.listening_addr,
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        let packeted = prepare_packet(&version);
 
-                sleep(Duration::from_millis(Self::INTERVAL_MS)).await;
-            }
-        });
+        node.send_broadcast(packeted).await;
+
+        Ok(())
     }
 }
