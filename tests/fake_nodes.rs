@@ -1,10 +1,13 @@
-use tokio::stream::{self, StreamExt};
+use tokio::{
+    stream::{self, StreamExt},
+    time::sleep,
+};
 
 mod common;
 use common::*;
 use pea2pea::*;
 
-use std::iter;
+use std::{iter, time::Duration};
 
 #[tokio::test]
 async fn initiate_handshake() {
@@ -30,19 +33,23 @@ async fn pose_as_bootstrapper() {
     config.inbound_message_queue_depth = 1024;
     let fake_bootstrapper = Node::new(Some(config)).await.unwrap();
 
-    let fake_nodes = spawn_nodes(999, None).await.unwrap();
+    let fake_nodes = spawn_nodes(9, None).await.unwrap();
     let fake_nodes = iter::once(fake_bootstrapper)
         .chain(fake_nodes.into_iter())
         .map(|node| FakeNode::from(node))
         .collect::<Vec<_>>();
 
     for node in &fake_nodes {
-        node.enable_messaging_protocol();
         node.enable_handshake_protocol();
-        node.enable_broadcast_protocol();
+        node.enable_messaging_protocol();
     }
 
     connect_nodes(&fake_nodes, Topology::Star).await.unwrap();
+
+    for node in &fake_nodes {
+        node.enable_broadcast_protocol();
+        sleep(Duration::from_secs(1)).await;
+    }
 
     stream::pending::<()>().next().await;
 }

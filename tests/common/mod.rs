@@ -1,29 +1,41 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::{io::AsyncReadExt, task::JoinHandle};
 use tracing::*;
 
 use pea2pea::*;
 use snarkos_network::external::{GetPeers, Message, MessageHeader, Peers, Verack, Version};
+use tokio::sync::RwLock;
 
-use std::{fmt, io, net::SocketAddr, ops::Deref, sync::Arc};
+use std::{collections::HashMap, fmt, io, net::SocketAddr, ops::Deref, sync::Arc};
 
 #[derive(Clone)]
 pub struct FakeNode {
     pub node: Arc<Node>,
+    // a map of *listening* addresses and last-seen timestamps for handshaken nodes
+    pub peers: Arc<RwLock<HashMap<SocketAddr, DateTime<Utc>>>>,
+    pub desired_connection_count: u8,
 }
+
+const DESIRED_CONNECTION_COUNT: u8 = 100;
 
 impl FakeNode {
     #[allow(dead_code)]
     pub async fn new(config: Option<NodeConfig>) -> Arc<Self> {
         Arc::new(Self {
             node: Node::new(config).await.unwrap(),
+            peers: Default::default(),
+            desired_connection_count: DESIRED_CONNECTION_COUNT,
         })
     }
 }
 
 impl From<Arc<Node>> for FakeNode {
     fn from(node: Arc<Node>) -> Self {
-        Self { node }
+        Self {
+            node,
+            peers: Default::default(),
+            desired_connection_count: DESIRED_CONNECTION_COUNT,
+        }
     }
 }
 
@@ -133,6 +145,45 @@ impl MessagingProtocol for FakeNode {
         Some(message)
     }
 
+    fn process_message(&self, message: &Self::Message) {
+        match message {
+            SnarkosMessage::Version(version) => {
+                let self_clone = self.clone();
+                let sender = version.sender;
+                tokio::spawn(async move {
+                    self_clone.peers.write().await.insert(sender, Utc::now());
+                });
+            }
+            SnarkosMessage::Peers(peers) => {
+                let peers = peers
+                    .addresses
+                    .iter()
+                    .map(|(addr, _)| *addr)
+                    .collect::<Vec<_>>();
+
+                let self_clone = self.clone();
+                tokio::spawn(async move {
+                    let node = self_clone.node();
+                    let mut peers = peers.into_iter();
+
+                    while let Some(addr) = peers.next() {
+                        if node.num_connected() < self_clone.desired_connection_count as usize {
+                            let mut peers_lock = self_clone.peers.write().await;
+                            if addr != node.listening_addr && !peers_lock.contains_key(&addr) {
+                                if let Err(e) = node.initiate_connection(addr).await {
+                                    error!(parent: node.span(), "couldn't connect to {}: {}", addr, e);
+                                } else {
+                                    peers_lock.insert(addr, Utc::now());
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
     fn respond_to_message(
         &self,
         message: Self::Message,
@@ -140,42 +191,44 @@ impl MessagingProtocol for FakeNode {
     ) -> io::Result<()> {
         info!(parent: self.node().span(), "got a {} from {}", message, source_addr);
 
-        let named_packet = match message {
-            SnarkosMessage::Version(_) => {
-                let nonce = self.node().listening_addr.port() as u64; // for simplicity
-                let verack = Verack::new(nonce, self.node().listening_addr, source_addr);
-                let packet = prepare_packet(&verack);
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            let node = self_clone.node();
 
-                Some(("Verack", packet))
-            }
-            SnarkosMessage::Verack(_) => None,
-            SnarkosMessage::GetPeers(_) => {
-                let addrs = self.node().handshaken_addrs();
-                let now = Utc::now();
-                let addrs_with_dates = addrs
-                    .into_iter()
-                    .filter(|&addr| addr != source_addr)
-                    .map(|addr| (addr, now))
-                    .collect::<Vec<_>>();
-                let peers = Peers::new(addrs_with_dates);
-                let packet = prepare_packet(&peers);
+            let named_packet = match message {
+                SnarkosMessage::Version(_) => {
+                    let nonce = node.listening_addr.port() as u64; // for simplicity
+                    let verack = Verack::new(nonce, node.listening_addr, source_addr);
+                    let packet = prepare_packet(&verack);
 
-                Some(("Peers", packet))
-            }
-            _ => None,
-        };
+                    Some(("Verack", packet))
+                }
+                SnarkosMessage::Verack(_) => None,
+                SnarkosMessage::GetPeers(_) => {
+                    let peers = self_clone
+                        .peers
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(addr, time)| (*addr, *time))
+                        .collect();
+                    let peers = Peers::new(peers);
+                    let packet = prepare_packet(&peers);
 
-        if let Some((name, packet)) = named_packet {
-            let self_clone = self.clone();
-            tokio::spawn(async move {
+                    Some(("Peers", packet))
+                }
+                _ => None,
+            };
+
+            if let Some((name, packet)) = named_packet {
                 self_clone
                     .send_direct_message(source_addr, packet)
                     .await
                     .unwrap();
 
-                info!(parent: self_clone.node().span(), "sent a {} to {}", name, source_addr);
-            });
-        }
+                info!(parent: node.span(), "sent a {} to {}", name, source_addr);
+            }
+        });
 
         Ok(())
     }
@@ -325,23 +378,36 @@ impl BroadcastProtocol for FakeNode {
     async fn perform_broadcast(&self) -> io::Result<()> {
         let node = self.node();
 
-        info!(parent: node.span(), "broadcasting Version");
+        if node.handshaken_addrs().len() != 0 {
+            info!(parent: node.span(), "broadcasting Version");
 
-        let block_height = 1; // TODO: keep a state that updates based on the highest received value
-        let nonce = node.listening_addr.port() as u64; // for simplicity
+            let block_height = 1; // TODO: keep a state that updates based on the highest received value
+            let nonce = node.listening_addr.port() as u64; // for simplicity
 
-        // provide the discard protocol as the port on the receiver side
-        // TODO: check if that value is not already ignored by snarkOS (it's probable)
-        let version = Version::new(
-            VERSION,
-            block_height,
-            nonce,
-            node.listening_addr,
-            "127.0.0.1:9".parse().unwrap(),
-        );
-        let packeted = prepare_packet(&version);
+            // provide the discard protocol as the port on the receiver side
+            // TODO: check if that value is not already ignored by snarkOS (it's probable)
+            let version = Version::new(
+                VERSION,
+                block_height,
+                nonce,
+                node.listening_addr,
+                "127.0.0.1:9".parse().unwrap(),
+            );
+            let packeted = prepare_packet(&version);
 
-        node.send_broadcast(packeted).await;
+            node.send_broadcast(packeted).await;
+
+            let num_connected = node.handshaken_addrs().len();
+            if num_connected < self.desired_connection_count as usize {
+                info!(parent: node.span(), "broadcasting GetPeers (I only have {}, and I want {})", num_connected, self.desired_connection_count);
+
+                let get_peers = GetPeers;
+                let packeted = prepare_packet(&get_peers);
+                node.send_broadcast(packeted).await;
+            } else {
+                debug!(parent: node.span(), "I don't need any more peers - not broadcasting GetPeers");
+            }
+        }
 
         Ok(())
     }
