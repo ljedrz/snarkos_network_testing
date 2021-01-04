@@ -1,11 +1,11 @@
-use tokio::time::sleep;
-
 mod common;
 use common::*;
 use pea2pea::{
     protocols::{Handshaking, Reading, Writing},
     *,
 };
+use tokio::time::sleep;
+use tracing::*;
 
 use std::{iter, sync::Arc, time::Duration};
 
@@ -38,28 +38,56 @@ async fn initiate_handshake() {
 async fn pose_as_bootstrapper() {
     tracing_subscriber::fmt::init();
 
-    let mut config = NodeConfig::default();
-    config.name = Some("bootstrapper".into());
-    config.desired_listening_port = Some(4141);
+    const NUM_NON_BOOTSTRAPPERS: usize = 49;
+
+    let config = NodeConfig {
+        name: Some("bootstrapper".into()),
+        desired_listening_port: Some(4141),
+        ..Default::default()
+    };
     let fake_bootstrapper = Node::new(Some(config)).await.unwrap();
 
-    let fake_nodes = start_nodes(9, None).await;
+    let config = NodeConfig {
+        max_connections: common::DESIRED_CONNECTION_COUNT as u16 + 5,
+        ..Default::default()
+    };
+    let fake_nodes = start_nodes(NUM_NON_BOOTSTRAPPERS, Some(config)).await;
     let fake_nodes = iter::once(fake_bootstrapper)
         .chain(fake_nodes.into_iter())
-        .map(|node| FakeNode::from(node))
+        .map(FakeNode::from)
         .collect::<Vec<_>>();
 
     for node in &fake_nodes {
         node.enable_handshaking();
         node.enable_reading();
-        // node.enable_writing();
+        node.enable_writing();
     }
 
     connect_nodes(&fake_nodes, Topology::Star).await.unwrap();
 
     for node in &fake_nodes {
-        node.start_broadcasting();
+        node.run_periodic_maintenance();
+        sleep(Duration::from_millis(50)).await;
     }
 
-    std::future::pending::<()>().await;
+    loop {
+        let bootstrapper_peer_count = fake_nodes[0].node().num_connected();
+        if bootstrapper_peer_count < common::DESIRED_CONNECTION_COUNT as usize {
+            error!(
+                "the bootstrapper isn't connected to all the fake nodes ({}/{})!",
+                bootstrapper_peer_count,
+                common::DESIRED_CONNECTION_COUNT
+            );
+        }
+
+        if fake_nodes
+            .iter()
+            .skip(1)
+            .any(|fake| fake.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
+        {
+            error!("not all the peers have the desired number of peers!");
+        }
+
+        sleep(Duration::from_secs(5)).await;
+    }
 }
