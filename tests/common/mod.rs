@@ -1,18 +1,25 @@
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use tokio::{io::AsyncReadExt, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, RwLock},
+    task::JoinHandle,
+};
 use tracing::*;
 
-use pea2pea::*;
+use pea2pea::{
+    connections::{Connection, ConnectionSide},
+    protocols::{Handshaking, Reading, Writing},
+    *,
+};
 use snarkos_network::external::{GetPeers, Message, MessageHeader, Peers, Verack, Version};
-use tokio::sync::RwLock;
 
 use std::{collections::HashMap, fmt, io, net::SocketAddr, ops::Deref, sync::Arc};
 
 #[derive(Clone)]
 pub struct FakeNode {
     pub node: Arc<Node>,
-    // a map of *listening* addresses and last-seen timestamps for handshaken nodes
-    pub peers: Arc<RwLock<HashMap<SocketAddr, DateTime<Utc>>>>,
+    // a map of listening addresses to the actual addresses of connected nodes
+    pub peers: Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
     pub desired_connection_count: u8,
 }
 
@@ -47,14 +54,20 @@ impl Deref for FakeNode {
     }
 }
 
-impl ContainsNode for FakeNode {
+impl Pea2Pea for FakeNode {
     fn node(&self) -> &Arc<Node> {
         &self.node
     }
 }
 
 #[derive(Debug)]
-pub enum SnarkosMessage {
+pub struct SnarkosFullMessage {
+    header: MessageHeader,
+    message: SnarkosMessage,
+}
+
+#[derive(Debug)]
+enum SnarkosMessage {
     Version(Version),
     Verack(Verack),
     GetPeers(GetPeers),
@@ -79,7 +92,7 @@ impl fmt::Display for SnarkosMessage {
 const VERSION: u64 = 1;
 const MESSAGE_HEADER_LEN: usize = 16;
 
-pub fn prepare_packet<M: Message>(message: &M) -> Vec<u8> {
+pub fn prepare_packet<M: Message>(message: &M) -> Bytes {
     let serialized = message.serialize().unwrap();
     let header = MessageHeader::new(M::name(), serialized.len() as u32);
 
@@ -87,72 +100,208 @@ pub fn prepare_packet<M: Message>(message: &M) -> Vec<u8> {
     ret.extend_from_slice(&header.serialize().unwrap());
     ret.extend_from_slice(&serialized);
 
-    ret
+    ret.into()
+}
+
+impl Handshaking for FakeNode {
+    fn enable_handshaking(&self) {
+        let (from_node_sender, mut from_node_receiver) = mpsc::channel(1);
+        self.node().set_handshake_handler(from_node_sender.into());
+
+        // spawn a background task dedicated to handling the handshakes
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some((mut conn, result_sender)) = from_node_receiver.recv().await {
+                    let peer_listening_addr = match !conn.side {
+                        ConnectionSide::Initiator => {
+                            debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
+
+                            // send own Version
+                            let block_height = 1; // TODO: 1 or 0?
+                            let nonce = conn.node.listening_addr.port() as u64; // for simplicity
+                            let version = Version::new(
+                                VERSION,
+                                block_height,
+                                nonce,
+                                conn.node.listening_addr,
+                                conn.addr,
+                            );
+                            let packeted = prepare_packet(&version);
+                            conn.writer().write_all(&packeted).await.unwrap();
+
+                            // receive a Verack
+                            let header =
+                                conn.reader().read_exact(MESSAGE_HEADER_LEN).await.unwrap();
+                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                            header_arr.copy_from_slice(header);
+                            let header = MessageHeader::from(header_arr);
+                            assert_eq!(header.name, Verack::name());
+                            let message_len = header.len as usize;
+                            let message = conn.reader().read_exact(message_len).await.unwrap();
+                            Verack::deserialize(message).unwrap();
+
+                            // receive a Version
+                            let header =
+                                conn.reader().read_exact(MESSAGE_HEADER_LEN).await.unwrap();
+                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                            header_arr.copy_from_slice(header);
+                            let header = MessageHeader::from(header_arr);
+                            assert_eq!(header.name, Version::name());
+                            let message_len = header.len as usize;
+                            let message = conn.reader().read_exact(message_len).await.unwrap();
+                            let peer_version = Version::deserialize(message).unwrap();
+
+                            // send a Verack
+                            let verack = Verack::new(nonce, conn.node.listening_addr, conn.addr);
+                            let packeted = prepare_packet(&verack);
+                            conn.writer().write_all(&packeted).await.unwrap();
+
+                            peer_version.sender
+                        }
+                        ConnectionSide::Responder => {
+                            debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
+
+                            // receive a Version
+                            let header =
+                                conn.reader().read_exact(MESSAGE_HEADER_LEN).await.unwrap();
+                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                            header_arr.copy_from_slice(header);
+                            let header = MessageHeader::from(header_arr);
+                            assert_eq!(header.name, Version::name());
+                            let message_len = header.len as usize;
+                            let message = conn.reader().read_exact(message_len).await.unwrap();
+                            let peer_version = Version::deserialize(message).unwrap();
+
+                            // send a Verack
+                            let nonce = conn.node.listening_addr.port() as u64; // for simplicity
+                            let verack = Verack::new(nonce, conn.node.listening_addr, conn.addr);
+                            let packeted = prepare_packet(&verack);
+                            conn.writer().write_all(&packeted).await.unwrap();
+
+                            // send own Version
+                            let block_height = 1; // TODO: 1 or 0?
+                            let version = Version::new(
+                                VERSION,
+                                block_height,
+                                nonce,
+                                conn.node.listening_addr,
+                                conn.addr,
+                            );
+                            let packeted = prepare_packet(&version);
+                            conn.writer().write_all(&packeted).await.unwrap();
+
+                            // receive a Verack
+                            let header =
+                                conn.reader().read_exact(MESSAGE_HEADER_LEN).await.unwrap();
+                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                            header_arr.copy_from_slice(header);
+                            let header = MessageHeader::from(header_arr);
+                            assert_eq!(header.name, Verack::name());
+                            let message_len = header.len as usize;
+                            let message = conn.reader().read_exact(message_len).await.unwrap();
+                            Verack::deserialize(message).unwrap();
+
+                            peer_version.sender
+                        }
+                    };
+
+                    self_clone
+                        .peers
+                        .write()
+                        .await
+                        .insert(peer_listening_addr, conn.addr);
+
+                    // return the Connection to the node
+                    if result_sender.send(Ok(conn)).is_err() {
+                        unreachable!(); // can't recover if this happens
+                    }
+                }
+            }
+        });
+    }
 }
 
 #[async_trait::async_trait]
-impl MessagingProtocol for FakeNode {
-    type Message = SnarkosMessage;
+impl Reading for FakeNode {
+    type Message = SnarkosFullMessage;
 
-    async fn read_message(connection_reader: &mut ConnectionReader) -> io::Result<Vec<u8>> {
-        let buffer = &mut connection_reader.buffer;
-
-        // read message header
-        connection_reader
-            .reader
-            .read_exact(&mut buffer[..MESSAGE_HEADER_LEN])
-            .await?;
+    fn read_message(
+        &self,
+        _source: SocketAddr,
+        buffer: &[u8],
+    ) -> io::Result<Option<(Self::Message, usize)>> {
+        // parse the header
+        let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+        header_arr.copy_from_slice(&buffer[..MESSAGE_HEADER_LEN]);
+        let header = MessageHeader::from(header_arr);
 
         // read payload length
-        let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-        header_arr.copy_from_slice(&buffer[..MESSAGE_HEADER_LEN]);
-        let header = MessageHeader::from(header_arr);
         let message_len = header.len as usize;
-        let packet_len = MESSAGE_HEADER_LEN + message_len;
 
         // read message payload
-        if message_len != 0 {
-            connection_reader
-                .reader
-                .read_exact(&mut buffer[MESSAGE_HEADER_LEN..packet_len])
-                .await?;
+        if message_len == 0 {
+            return Err(io::ErrorKind::InvalidData.into());
         }
 
-        Ok(buffer[..packet_len].to_vec())
-    }
-
-    fn parse_message(&self, buffer: &[u8]) -> Option<Self::Message> {
-        let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-        header_arr.copy_from_slice(&buffer[..MESSAGE_HEADER_LEN]);
-        let header = MessageHeader::from(header_arr);
-
-        let message_len = header.len as usize;
-        let packet_len = MESSAGE_HEADER_LEN + message_len;
-        let message = &buffer[MESSAGE_HEADER_LEN..packet_len];
+        let message = &buffer[MESSAGE_HEADER_LEN..][..message_len];
 
         let message = if header.name == Version::name() {
-            SnarkosMessage::Version(Version::deserialize(message).ok()?)
+            SnarkosMessage::Version(
+                Version::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
+            )
         } else if header.name == Verack::name() {
-            SnarkosMessage::Verack(Verack::deserialize(message).ok()?)
+            SnarkosMessage::Verack(
+                Verack::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
+            )
         } else if header.name == GetPeers::name() {
-            SnarkosMessage::GetPeers(GetPeers::deserialize(message).ok()?)
+            SnarkosMessage::GetPeers(
+                GetPeers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
+            )
         } else if header.name == Peers::name() {
-            SnarkosMessage::Peers(Peers::deserialize(message).ok()?)
+            SnarkosMessage::Peers(
+                Peers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
+            )
         } else {
             SnarkosMessage::Unsupported
         };
 
-        Some(message)
+        let full_message = SnarkosFullMessage { header, message };
+
+        Ok(Some((full_message, MESSAGE_HEADER_LEN + message_len)))
     }
 
-    fn process_message(&self, message: &Self::Message) {
-        match message {
+    async fn process_message(
+        &self,
+        source: SocketAddr,
+        full_message: Self::Message,
+    ) -> io::Result<()> {
+        let named_response = match full_message.message {
             SnarkosMessage::Version(version) => {
                 let self_clone = self.clone();
                 let sender = version.sender;
                 tokio::spawn(async move {
-                    self_clone.peers.write().await.insert(sender, Utc::now());
+                    self_clone.peers.write().await.insert(sender, source);
                 });
+
+                let nonce = self.node().listening_addr.port() as u64; // for simplicity
+                let verack = Verack::new(nonce, self.node().listening_addr, source);
+                let packet = prepare_packet(&verack);
+
+                Some(("Verack", packet))
+            }
+            SnarkosMessage::GetPeers(_) => {
+                let peers = self
+                    .peers
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(addr, _)| (*addr, Utc::now()))
+                    .collect();
+                let peers = Peers::new(peers);
+                let packet = prepare_packet(&peers);
+
+                Some(("Peers", packet))
             }
             SnarkosMessage::Peers(peers) => {
                 let peers = peers
@@ -170,212 +319,38 @@ impl MessagingProtocol for FakeNode {
                         if node.num_connected() < self_clone.desired_connection_count as usize {
                             let mut peers_lock = self_clone.peers.write().await;
                             if addr != node.listening_addr && !peers_lock.contains_key(&addr) {
-                                if let Err(e) = node.initiate_connection(addr).await {
+                                if let Err(e) = node.connect(addr).await {
                                     error!(parent: node.span(), "couldn't connect to {}: {}", addr, e);
                                 } else {
-                                    peers_lock.insert(addr, Utc::now());
+                                    peers_lock.insert(addr, source);
                                 }
                             }
                         }
                     }
                 });
+
+                None
             }
-            _ => {}
+            _ => None,
+        };
+
+        if let Some((name, response)) = named_response {
+            self.node()
+                .send_direct_message(source, response)
+                .await
+                .unwrap();
+
+            info!(parent: self.node().span(), "sent a {} to {}", name, source);
         }
-    }
-
-    fn respond_to_message(
-        &self,
-        message: Self::Message,
-        source_addr: SocketAddr,
-    ) -> io::Result<()> {
-        info!(parent: self.node().span(), "got a {} from {}", message, source_addr);
-
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            let node = self_clone.node();
-
-            let named_packet = match message {
-                SnarkosMessage::Version(_) => {
-                    let nonce = node.listening_addr.port() as u64; // for simplicity
-                    let verack = Verack::new(nonce, node.listening_addr, source_addr);
-                    let packet = prepare_packet(&verack);
-
-                    Some(("Verack", packet))
-                }
-                SnarkosMessage::Verack(_) => None,
-                SnarkosMessage::GetPeers(_) => {
-                    let peers = self_clone
-                        .peers
-                        .read()
-                        .await
-                        .iter()
-                        .map(|(addr, time)| (*addr, *time))
-                        .collect();
-                    let peers = Peers::new(peers);
-                    let packet = prepare_packet(&peers);
-
-                    Some(("Peers", packet))
-                }
-                _ => None,
-            };
-
-            if let Some((name, packet)) = named_packet {
-                self_clone
-                    .send_direct_message(source_addr, packet)
-                    .await
-                    .unwrap();
-
-                info!(parent: node.span(), "sent a {} to {}", name, source_addr);
-            }
-        });
 
         Ok(())
     }
 }
 
-impl HandshakeProtocol for FakeNode {
-    fn enable_handshake_protocol(&self) {
-        let initiator = |peer_addr: SocketAddr,
-                         mut connection_reader: ConnectionReader,
-                         connection: Arc<Connection>|
-         -> JoinHandle<ConnectionReader> {
-            tokio::spawn(async move {
-                let node = Arc::clone(&connection_reader.node);
-                debug!(parent: node.span(), "spawned a task to handshake with {}", peer_addr);
-
-                // send own Version
-                let block_height = 1; // TODO: 1 or 0?
-                let nonce = node.listening_addr.port() as u64; // for simplicity
-                let version =
-                    Version::new(VERSION, block_height, nonce, node.listening_addr, peer_addr);
-                let packeted = prepare_packet(&version);
-                connection.write_bytes(&packeted).await.unwrap();
-
-                // receive a Verack
-                assert_eq!(
-                    connection_reader
-                        .read_bytes(MESSAGE_HEADER_LEN)
-                        .await
-                        .unwrap(),
-                    MESSAGE_HEADER_LEN
-                );
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                header_arr.copy_from_slice(&connection_reader.buffer[..MESSAGE_HEADER_LEN]);
-                let header = MessageHeader::from(header_arr);
-                assert_eq!(header.name, Verack::name());
-                let message_len = header.len as usize;
-                assert_eq!(
-                    connection_reader.read_bytes(message_len).await.unwrap(),
-                    message_len
-                );
-                Verack::deserialize(&connection_reader.buffer[..message_len]).unwrap();
-
-                // receive a Version
-                assert_eq!(
-                    connection_reader
-                        .read_bytes(MESSAGE_HEADER_LEN)
-                        .await
-                        .unwrap(),
-                    MESSAGE_HEADER_LEN
-                );
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                header_arr.copy_from_slice(&connection_reader.buffer[..MESSAGE_HEADER_LEN]);
-                let header = MessageHeader::from(header_arr);
-                assert_eq!(header.name, Version::name());
-                let message_len = header.len as usize;
-                assert_eq!(
-                    connection_reader.read_bytes(message_len).await.unwrap(),
-                    message_len
-                );
-                Version::deserialize(&connection_reader.buffer[..message_len]).unwrap();
-
-                // send a Verack
-                let verack = Verack::new(nonce, node.listening_addr, peer_addr);
-                let packeted = prepare_packet(&verack);
-                connection.write_bytes(&packeted).await.unwrap();
-
-                connection_reader
-            })
-        };
-
-        let responder = |peer_addr: SocketAddr,
-                         mut connection_reader: ConnectionReader,
-                         connection: Arc<Connection>|
-         -> JoinHandle<ConnectionReader> {
-            tokio::spawn(async move {
-                let node = Arc::clone(&connection_reader.node);
-                debug!(parent: node.span(), "spawned a task to handshake with {}", peer_addr);
-
-                // receive a Version
-                assert_eq!(
-                    connection_reader
-                        .read_bytes(MESSAGE_HEADER_LEN)
-                        .await
-                        .unwrap(),
-                    MESSAGE_HEADER_LEN
-                );
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                header_arr.copy_from_slice(&connection_reader.buffer[..MESSAGE_HEADER_LEN]);
-                let header = MessageHeader::from(header_arr);
-                assert_eq!(header.name, Version::name());
-                let message_len = header.len as usize;
-                assert_eq!(
-                    connection_reader.read_bytes(message_len).await.unwrap(),
-                    message_len
-                );
-                Version::deserialize(&connection_reader.buffer[..message_len]).unwrap();
-
-                // send a Verack
-                let nonce = node.listening_addr.port() as u64; // for simplicity
-                let verack = Verack::new(nonce, node.listening_addr, peer_addr);
-                let packeted = prepare_packet(&verack);
-                connection.write_bytes(&packeted).await.unwrap();
-
-                // send own Version
-                let block_height = 1; // TODO: 1 or 0?
-                let version =
-                    Version::new(VERSION, block_height, nonce, node.listening_addr, peer_addr);
-                let packeted = prepare_packet(&version);
-                connection.write_bytes(&packeted).await.unwrap();
-
-                // receive a Verack
-                assert_eq!(
-                    connection_reader
-                        .read_bytes(MESSAGE_HEADER_LEN)
-                        .await
-                        .unwrap(),
-                    MESSAGE_HEADER_LEN
-                );
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                header_arr.copy_from_slice(&connection_reader.buffer[..MESSAGE_HEADER_LEN]);
-                let header = MessageHeader::from(header_arr);
-                assert_eq!(header.name, Verack::name());
-                let message_len = header.len as usize;
-                assert_eq!(
-                    connection_reader.read_bytes(message_len).await.unwrap(),
-                    message_len
-                );
-                Verack::deserialize(&connection_reader.buffer[..message_len]).unwrap();
-
-                connection_reader
-            })
-        };
-
-        let handshake_closures = HandshakeClosures {
-            initiator: Box::new(initiator),
-            responder: Box::new(responder),
-        };
-
-        self.node().set_handshake_closures(handshake_closures);
-    }
-}
-
-#[async_trait::async_trait]
-impl BroadcastProtocol for FakeNode {
-    const INTERVAL_MS: u64 = 10_000;
-
-    async fn perform_broadcast(&self) -> io::Result<()> {
+impl FakeNode {
+    pub fn start_broadcasting(&self) {
+        const INTERVAL_MS: u64 = 10_000;
+        /*
         let node = self.node();
 
         if node.handshaken_addrs().len() != 0 {
@@ -407,8 +382,6 @@ impl BroadcastProtocol for FakeNode {
             } else {
                 debug!(parent: node.span(), "I don't need any more peers - not broadcasting GetPeers");
             }
-        }
-
-        Ok(())
+        }*/
     }
 }

@@ -1,24 +1,35 @@
-use tokio::{
-    stream::{self, StreamExt},
-    time::sleep,
-};
+use tokio::time::sleep;
 
 mod common;
 use common::*;
-use pea2pea::*;
+use pea2pea::{
+    protocols::{Handshaking, Reading, Writing},
+    *,
+};
 
-use std::{iter, time::Duration};
+use std::{iter, sync::Arc, time::Duration};
+
+async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Arc<Node>> {
+    let mut nodes = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let node = Node::new(config.clone()).await.unwrap();
+        nodes.push(node);
+    }
+
+    nodes
+}
 
 #[tokio::test]
 async fn initiate_handshake() {
     tracing_subscriber::fmt::init();
 
     let fake_node = FakeNode::new(None).await;
-    fake_node.enable_handshake_protocol();
+    fake_node.enable_handshaking();
 
     fake_node
         .node
-        .initiate_connection("127.0.0.1:4131".parse().unwrap())
+        .connect("127.0.0.1:4131".parse().unwrap())
         .await
         .unwrap();
 }
@@ -30,26 +41,25 @@ async fn pose_as_bootstrapper() {
     let mut config = NodeConfig::default();
     config.name = Some("bootstrapper".into());
     config.desired_listening_port = Some(4141);
-    config.inbound_message_queue_depth = 1024;
     let fake_bootstrapper = Node::new(Some(config)).await.unwrap();
 
-    let fake_nodes = spawn_nodes(9, None).await.unwrap();
+    let fake_nodes = start_nodes(9, None).await;
     let fake_nodes = iter::once(fake_bootstrapper)
         .chain(fake_nodes.into_iter())
         .map(|node| FakeNode::from(node))
         .collect::<Vec<_>>();
 
     for node in &fake_nodes {
-        node.enable_handshake_protocol();
-        node.enable_messaging_protocol();
+        node.enable_handshaking();
+        node.enable_reading();
+        // node.enable_writing();
     }
 
     connect_nodes(&fake_nodes, Topology::Star).await.unwrap();
 
     for node in &fake_nodes {
-        node.enable_broadcast_protocol();
-        sleep(Duration::from_secs(1)).await;
+        node.start_broadcasting();
     }
 
-    stream::pending::<()>().next().await;
+    std::future::pending::<()>().await;
 }
