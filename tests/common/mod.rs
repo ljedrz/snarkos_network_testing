@@ -109,20 +109,21 @@ macro_rules! unwrap_or_bail {
     ($action: expr, $sender: expr) => {{
         let ret = $action;
 
-        if ret.is_err() {
-            let err = io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "already connected, not handshaking",
-            );
+        match ret {
+            Ok(ret) => ret,
+            Err(_) => {
+                let err = io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "already connected, not handshaking",
+                );
 
-            if $sender.send(Err(err)).is_err() {
-                error!("\npanic!\n");
-                unreachable!(); // can't recover if this happens
+                if $sender.send(Err(err)).is_err() {
+                    error!("\npanic!\n");
+                    unreachable!(); // can't recover if this happens
+                }
+
+                continue;
             }
-
-            continue;
-        } else {
-            ret.unwrap()
         }
     }};
 }
@@ -449,19 +450,17 @@ impl FakeNode {
 
                     let num_connected = node.num_connected();
                     if num_connected < self_clone.desired_connection_count as usize {
-                        // disregard (if not bootstrapper) for now in order to keep sending GetPeers requests
-                        if node.name() == "bootstrapper" {
-                            let candidates = mem::take(&mut *self_clone.peer_candidates.write());
-                            for addr in candidates {
-                                if node.num_connected()
-                                    < self_clone.desired_connection_count as usize
-                                {
-                                    if let Err(e) = node.connect(addr).await {
-                                        error!(parent: node.span(), "couldn't connect to {}: {}", addr, e);
-                                    }
+                        // comment out the bootstrapper condition in order to keep sending GetPeers requests
+                        // if node.name() == "bootstrapper" {
+                        let candidates = mem::take(&mut *self_clone.peer_candidates.write());
+                        for addr in candidates {
+                            if node.num_connected() < self_clone.desired_connection_count as usize {
+                                if let Err(e) = node.connect(addr).await {
+                                    error!(parent: node.span(), "couldn't connect to {}: {}", addr, e);
                                 }
                             }
                         }
+                        // }
 
                         let num_connected = node.num_connected();
                         if num_connected < self_clone.desired_connection_count as usize {

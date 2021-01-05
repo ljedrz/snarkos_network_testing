@@ -79,13 +79,62 @@ async fn pose_as_bootstrapper() {
                 common::DESIRED_CONNECTION_COUNT
             );
         }
+        /*
+                if fake_nodes
+                    .iter()
+                    .skip(1)
+                    .any(|fake| fake.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
+                {
+                    error!("not all the peers have the desired number of peers!");
+                }
+        */
+        sleep(Duration::from_secs(5)).await;
+    }
+}
 
+#[tokio::test]
+async fn stress_test_snarkos_bootstrapper() {
+    tracing_subscriber::fmt::init();
+
+    const NUM_NON_BOOTSTRAPPERS: usize = 50;
+
+    let config = NodeConfig {
+        max_connections: common::DESIRED_CONNECTION_COUNT as u16 + 5,
+        ..Default::default()
+    };
+    let fake_nodes = start_nodes(NUM_NON_BOOTSTRAPPERS, Some(config)).await;
+    let fake_nodes = fake_nodes
+        .into_iter()
+        .map(FakeNode::from)
+        .collect::<Vec<_>>();
+
+    for node in &fake_nodes {
+        node.enable_handshaking();
+        node.enable_reading();
+        node.enable_writing();
+    }
+
+    for node in &fake_nodes {
+        node.node()
+            .connect("127.0.0.1:4141".parse().unwrap())
+            .await
+            .unwrap();
+    }
+
+    for node in &fake_nodes {
+        node.run_periodic_maintenance();
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    loop {
         if fake_nodes
             .iter()
-            .skip(1)
-            .any(|fake| fake.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
+            .any(|node| node.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
         {
-            error!("not all the peers have the desired number of peers!");
+            error!(
+                "a fake node doesn't have the desired number of peers ({})!",
+                common::DESIRED_CONNECTION_COUNT
+            );
         }
 
         sleep(Duration::from_secs(5)).await;
