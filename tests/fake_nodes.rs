@@ -6,8 +6,23 @@ use pea2pea::{
 };
 use tokio::time::sleep;
 use tracing::*;
+use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use std::{future, iter, time::Duration};
+
+fn start_logger() {
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter.add_directive("mio=off".parse().unwrap()),
+        _ => EnvFilter::default()
+            .add_directive(LevelFilter::INFO.into())
+            .add_directive("mio=off".parse().unwrap()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .without_time()
+        .with_target(false)
+        .init();
+}
 
 async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Node> {
     let mut nodes = Vec::with_capacity(count);
@@ -22,7 +37,7 @@ async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Node> {
 
 #[tokio::test]
 async fn pose_as_bootstrapper_with_peers() {
-    tracing_subscriber::fmt::init();
+    start_logger();
 
     const NUM_NON_BOOTSTRAPPERS: usize = 49;
 
@@ -80,7 +95,7 @@ async fn pose_as_bootstrapper_with_peers() {
 
 #[tokio::test]
 async fn stress_test_snarkos_bootstrapper() {
-    tracing_subscriber::fmt::init();
+    start_logger();
 
     const NUM_NON_BOOTSTRAPPERS: usize = 50;
 
@@ -129,7 +144,7 @@ async fn stress_test_snarkos_bootstrapper() {
 
 #[tokio::test]
 async fn single_plain_node() {
-    tracing_subscriber::fmt::init();
+    start_logger();
 
     let fake_node = FakeNode::from(Node::new(None).await.unwrap());
     fake_node.enable_handshaking();

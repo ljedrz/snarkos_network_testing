@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use chrono::Utc;
-use parking_lot::RwLock;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex as SyncMutex;
+use rand::{rngs::SmallRng, seq::IteratorRandom, SeedableRng};
 use tokio::{
     sync::{mpsc, Mutex},
     time::sleep,
@@ -15,8 +17,8 @@ use pea2pea::{
 use snarkos_network::external::{GetPeers, Message, MessageHeader, Peers, Verack, Version};
 
 use std::{
-    collections::{HashMap, HashSet},
-    fmt, io, mem,
+    collections::HashMap,
+    fmt, io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -26,6 +28,8 @@ use std::{
 };
 
 pub const DESIRED_CONNECTION_COUNT: u8 = 5;
+pub static RNG: Lazy<SyncMutex<SmallRng>> = Lazy::new(|| SyncMutex::new(SmallRng::from_entropy()));
+
 const VERSION: u64 = 1;
 const MESSAGE_HEADER_LEN: usize = 16;
 
@@ -34,7 +38,6 @@ pub struct FakeNode {
     pub node: Node,
     // a map of listening addresses to the actual addresses of connected nodes
     pub peers: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
-    pub peer_candidates: Arc<RwLock<HashSet<SocketAddr>>>,
     pub desired_connection_count: u8,
     pub current_block_height: Arc<AtomicU32>,
 }
@@ -44,7 +47,6 @@ impl From<Node> for FakeNode {
         Self {
             node,
             peers: Default::default(),
-            peer_candidates: Default::default(),
             desired_connection_count: DESIRED_CONNECTION_COUNT,
             current_block_height: Default::default(),
         }
@@ -290,7 +292,7 @@ impl Reading for FakeNode {
 
     fn read_message(
         &self,
-        _source: SocketAddr,
+        source: SocketAddr,
         buffer: &[u8],
     ) -> io::Result<Option<(Self::Message, usize)>> {
         // parse the header
@@ -305,22 +307,27 @@ impl Reading for FakeNode {
         let message = &buffer[MESSAGE_HEADER_LEN..][..message_len];
 
         let message = if header.name == Version::name() {
+            info!(parent: self.node().span(), "got a Version from {}", source);
             SnarkosMessage::Version(
                 Version::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
             )
         } else if header.name == Verack::name() {
+            info!(parent: self.node().span(), "got a Verack from {}", source);
             SnarkosMessage::Verack(
                 Verack::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
             )
         } else if header.name == GetPeers::name() {
+            info!(parent: self.node().span(), "got a GetPeers from {}", source);
             SnarkosMessage::GetPeers(
                 GetPeers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
             )
         } else if header.name == Peers::name() {
+            info!(parent: self.node().span(), "got a Peers from {}", source);
             SnarkosMessage::Peers(
                 Peers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
             )
         } else {
+            info!(parent: self.node().span(), "got an unsupported message from {}", source);
             SnarkosMessage::Unsupported
         };
 
@@ -337,6 +344,10 @@ impl Reading for FakeNode {
         let named_response = match full_message.message {
             SnarkosMessage::Version(_) => {
                 // only used for sync purposes post-handshake
+                None
+            }
+            SnarkosMessage::Verack(_) => {
+                // only used for the handshake
                 None
             }
             SnarkosMessage::GetPeers(_) => {
@@ -359,20 +370,28 @@ impl Reading for FakeNode {
                 }
             }
             SnarkosMessage::Peers(peers) => {
-                let mut candidates = self.peer_candidates.write();
-
-                for (peer_addr, _) in peers
-                    .addresses
-                    .iter()
-                    .copied()
-                    .filter(|&(addr, _)| addr != self.node().listening_addr() && addr != source)
+                // comment out the bootstrapper condition in order for all nodes to keep sending GetPeers requests
+                // if node.name() == "bootstrapper" {
+                if !peers.addresses.is_empty()
+                    && self.node().num_connected() < self.desired_connection_count as usize
                 {
-                    candidates.insert(peer_addr);
+                    // connect to only one candidate at once to avoid maxing the node's connection limit
+                    let addr = peers
+                        .addresses
+                        .iter()
+                        .filter(|&(addr, _)| *addr != self.node().listening_addr())
+                        .choose(&mut *RNG.lock())
+                        .unwrap()
+                        .0;
+                    if let Err(e) = self.node().connect(addr).await {
+                        error!(parent: self.node().span(), "couldn't connect to {}: {}", addr, e);
+                    }
                 }
+                // }
 
                 None
             }
-            _ => None,
+            SnarkosMessage::Unsupported => None,
         };
 
         if let Some((name, response)) = named_response {
@@ -408,6 +427,7 @@ impl FakeNode {
                 sleep(Duration::from_secs(BROADCAST_INTERVAL_SECS)).await;
                 debug!(parent: node.span(), "running maintenance");
 
+                // disconnect from misbehaving peers if still connected
                 let mut to_disconnect = Vec::new();
                 for (addr, stats) in node.known_peers().write().iter_mut() {
                     if stats.failures != 0 {
@@ -419,39 +439,25 @@ impl FakeNode {
                     node.disconnect(addr);
                 }
 
-                if node.num_connected() != 0 {
+                let num_connected = node.num_connected();
+
+                if num_connected < self_clone.desired_connection_count as usize {
+                    // broadcast GetPeers
+                    info!(parent: node.span(), "broadcasting GetPeers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
+
+                    let packeted = prepare_packet(&GetPeers);
+                    node.send_broadcast(packeted).await.unwrap();
+                } else {
+                    debug!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
+                }
+
+                if num_connected != 0 {
+                    // broadcast Version
                     info!(parent: node.span(), "broadcasting Version");
 
-                    // provide the discard protocol as the port on the receiver side
-                    let version = self_clone.produce_version("127.0.0.1:9".parse().unwrap());
+                    let version = self_clone.produce_version("127.0.0.1:9".parse().unwrap()); // the discard protocol port
                     let packeted = prepare_packet(&version);
-
                     node.send_broadcast(packeted).await.unwrap();
-
-                    let num_connected = node.num_connected();
-                    if num_connected < self_clone.desired_connection_count as usize {
-                        // comment out the bootstrapper condition in order for all nodes to keep sending GetPeers requests
-                        // if node.name() == "bootstrapper" {
-                        let candidates = mem::take(&mut *self_clone.peer_candidates.write());
-                        for addr in candidates {
-                            if node.num_connected() < self_clone.desired_connection_count as usize {
-                                if let Err(e) = node.connect(addr).await {
-                                    error!(parent: node.span(), "couldn't connect to {}: {}", addr, e);
-                                }
-                            }
-                        }
-                        // }
-
-                        let num_connected = node.num_connected();
-                        if num_connected < self_clone.desired_connection_count as usize {
-                            info!(parent: node.span(), "broadcasting GetPeers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
-
-                            let packeted = prepare_packet(&GetPeers);
-                            node.send_broadcast(packeted).await.unwrap();
-                        }
-                    } else {
-                        debug!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
-                    }
                 }
             }
         });
