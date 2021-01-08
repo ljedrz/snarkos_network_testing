@@ -18,46 +18,53 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, io, mem,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
+pub const DESIRED_CONNECTION_COUNT: u8 = 5;
+const VERSION: u64 = 1;
+const MESSAGE_HEADER_LEN: usize = 16;
+
 #[derive(Clone)]
 pub struct FakeNode {
-    pub node: Arc<Node>,
+    pub node: Node,
     // a map of listening addresses to the actual addresses of connected nodes
     pub peers: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
     pub peer_candidates: Arc<RwLock<HashSet<SocketAddr>>>,
     pub desired_connection_count: u8,
+    pub current_block_height: Arc<AtomicU32>,
 }
 
-pub const DESIRED_CONNECTION_COUNT: u8 = 5;
-
-impl FakeNode {
-    #[allow(dead_code)]
-    pub async fn new(config: Option<NodeConfig>) -> Arc<Self> {
-        Arc::new(Self {
-            node: Node::new(config).await.unwrap(),
-            peers: Default::default(),
-            peer_candidates: Default::default(),
-            desired_connection_count: DESIRED_CONNECTION_COUNT,
-        })
-    }
-}
-
-impl From<Arc<Node>> for FakeNode {
-    fn from(node: Arc<Node>) -> Self {
+impl From<Node> for FakeNode {
+    fn from(node: Node) -> Self {
         Self {
             node,
             peers: Default::default(),
             peer_candidates: Default::default(),
             desired_connection_count: DESIRED_CONNECTION_COUNT,
+            current_block_height: Default::default(),
         }
     }
 }
 
+impl FakeNode {
+    fn produce_version(&self, receiver_addr: SocketAddr) -> Version {
+        Version::new(
+            VERSION,
+            self.current_block_height.load(Ordering::SeqCst),
+            self.node.listening_addr().port() as u64, // for simplicity,
+            self.node.listening_addr(),
+            receiver_addr,
+        )
+    }
+}
+
 impl Pea2Pea for FakeNode {
-    fn node(&self) -> &Arc<Node> {
+    fn node(&self) -> &Node {
         &self.node
     }
 }
@@ -90,9 +97,6 @@ impl fmt::Display for SnarkosMessage {
         write!(f, "{}", name)
     }
 }
-
-const VERSION: u64 = 1;
-const MESSAGE_HEADER_LEN: usize = 16;
 
 pub fn prepare_packet<M: Message>(message: &M) -> Bytes {
     let serialized = message.serialize().unwrap();
@@ -157,15 +161,7 @@ impl Handshaking for FakeNode {
                             debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
 
                             // send own Version
-                            let block_height = 1; // TODO: 1 or 0?
-                            let nonce = conn.node.listening_addr.port() as u64; // for simplicity
-                            let version = Version::new(
-                                VERSION,
-                                block_height,
-                                nonce,
-                                conn.node.listening_addr,
-                                conn.addr,
-                            );
+                            let version = self_clone.produce_version(conn.addr);
                             let packeted = prepare_packet(&version);
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -206,7 +202,8 @@ impl Handshaking for FakeNode {
                                 unwrap_or_bail!(Version::deserialize(message), result_sender);
 
                             // send a Verack
-                            let verack = Verack::new(nonce, conn.node.listening_addr, conn.addr);
+                            let nonce = conn.node.listening_addr().port() as u64; // for simplicity
+                            let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
                             let packeted = prepare_packet(&verack);
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -236,8 +233,8 @@ impl Handshaking for FakeNode {
                                 unwrap_or_bail!(Version::deserialize(message), result_sender);
 
                             // send a Verack
-                            let nonce = conn.node.listening_addr.port() as u64; // for simplicity
-                            let verack = Verack::new(nonce, conn.node.listening_addr, conn.addr);
+                            let nonce = conn.node.listening_addr().port() as u64; // for simplicity
+                            let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
                             let packeted = prepare_packet(&verack);
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -245,14 +242,7 @@ impl Handshaking for FakeNode {
                             );
 
                             // send own Version
-                            let block_height = 1; // TODO: 1 or 0?
-                            let version = Version::new(
-                                VERSION,
-                                block_height,
-                                nonce,
-                                conn.node.listening_addr,
-                                conn.addr,
-                            );
+                            let version = self_clone.produce_version(conn.addr);
                             let packeted = prepare_packet(&version);
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -375,7 +365,7 @@ impl Reading for FakeNode {
                     .addresses
                     .iter()
                     .copied()
-                    .filter(|&(addr, _)| addr != self.node.listening_addr && addr != source)
+                    .filter(|&(addr, _)| addr != self.node().listening_addr() && addr != source)
                 {
                     candidates.insert(peer_addr);
                 }
@@ -432,25 +422,15 @@ impl FakeNode {
                 if node.num_connected() != 0 {
                     info!(parent: node.span(), "broadcasting Version");
 
-                    let block_height = 1; // TODO: keep a state that updates based on the highest received value
-                    let nonce = node.listening_addr.port() as u64; // for simplicity
-
                     // provide the discard protocol as the port on the receiver side
-                    // TODO: check if that value is not already ignored by snarkOS (it's probable)
-                    let version = Version::new(
-                        VERSION,
-                        block_height,
-                        nonce,
-                        node.listening_addr,
-                        "127.0.0.1:9".parse().unwrap(),
-                    );
+                    let version = self_clone.produce_version("127.0.0.1:9".parse().unwrap());
                     let packeted = prepare_packet(&version);
 
                     node.send_broadcast(packeted).await.unwrap();
 
                     let num_connected = node.num_connected();
                     if num_connected < self_clone.desired_connection_count as usize {
-                        // comment out the bootstrapper condition in order to keep sending GetPeers requests
+                        // comment out the bootstrapper condition in order for all nodes to keep sending GetPeers requests
                         // if node.name() == "bootstrapper" {
                         let candidates = mem::take(&mut *self_clone.peer_candidates.write());
                         for addr in candidates {
@@ -470,7 +450,7 @@ impl FakeNode {
                             node.send_broadcast(packeted).await.unwrap();
                         }
                     } else {
-                        info!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
+                        debug!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
                     }
                 }
             }

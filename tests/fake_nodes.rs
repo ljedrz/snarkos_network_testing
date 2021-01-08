@@ -7,9 +7,9 @@ use pea2pea::{
 use tokio::time::sleep;
 use tracing::*;
 
-use std::{iter, sync::Arc, time::Duration};
+use std::{future, iter, time::Duration};
 
-async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Arc<Node>> {
+async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Node> {
     let mut nodes = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -21,21 +21,7 @@ async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Arc<Node>>
 }
 
 #[tokio::test]
-async fn initiate_handshake() {
-    tracing_subscriber::fmt::init();
-
-    let fake_node = FakeNode::new(None).await;
-    fake_node.enable_handshaking();
-
-    fake_node
-        .node
-        .connect("127.0.0.1:4131".parse().unwrap())
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn pose_as_bootstrapper() {
+async fn pose_as_bootstrapper_with_peers() {
     tracing_subscriber::fmt::init();
 
     const NUM_NON_BOOTSTRAPPERS: usize = 49;
@@ -139,4 +125,23 @@ async fn stress_test_snarkos_bootstrapper() {
 
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+#[tokio::test]
+async fn single_plain_node() {
+    tracing_subscriber::fmt::init();
+
+    let fake_node = FakeNode::from(Node::new(None).await.unwrap());
+    fake_node.enable_handshaking();
+    fake_node.enable_reading();
+    fake_node.enable_writing();
+    fake_node.run_periodic_maintenance();
+
+    fake_node
+        .node()
+        .connect("127.0.0.1:4141".parse().unwrap())
+        .await
+        .unwrap();
+
+    future::pending::<()>().await;
 }
