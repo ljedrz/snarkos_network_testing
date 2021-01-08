@@ -31,7 +31,7 @@ pub const DESIRED_CONNECTION_COUNT: u8 = 5;
 pub static RNG: Lazy<SyncMutex<SmallRng>> = Lazy::new(|| SyncMutex::new(SmallRng::from_entropy()));
 
 const VERSION: u64 = 1;
-const MESSAGE_HEADER_LEN: usize = 16;
+const MESSAGE_HEADER_LEN: usize = 5;
 
 #[derive(Clone)]
 pub struct FakeNode {
