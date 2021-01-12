@@ -3,6 +3,7 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex as SyncMutex;
 use rand::{rngs::SmallRng, seq::IteratorRandom, SeedableRng};
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, Mutex},
     time::sleep,
@@ -11,10 +12,10 @@ use tracing::*;
 
 use pea2pea::{
     connections::ConnectionSide,
-    protocols::{Handshaking, Reading, Writing},
+    protocols::{Handshaking, Reading, ReturnableConnection, Writing},
     *,
 };
-use snarkos_network::external::{GetPeers, Message, MessageHeader, Peers, Verack, Version};
+use snarkos_network::external::*;
 
 use std::{
     collections::HashMap,
@@ -31,7 +32,7 @@ pub const DESIRED_CONNECTION_COUNT: u8 = 5;
 pub static RNG: Lazy<SyncMutex<SmallRng>> = Lazy::new(|| SyncMutex::new(SmallRng::from_entropy()));
 
 const VERSION: u64 = 1;
-const MESSAGE_HEADER_LEN: usize = 5;
+const MESSAGE_HEADER_LEN: usize = 4;
 
 #[derive(Clone)]
 pub struct FakeNode {
@@ -74,38 +75,17 @@ impl Pea2Pea for FakeNode {
 #[derive(Debug)]
 pub struct SnarkosFullMessage {
     header: MessageHeader,
-    message: SnarkosMessage,
+    message: Payload,
 }
 
-#[derive(Debug)]
-enum SnarkosMessage {
-    Version(Version),
-    Verack(Verack),
-    GetPeers(GetPeers),
-    Peers(Peers),
-    Unsupported,
-}
-
-impl fmt::Display for SnarkosMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Version(_) => "Version",
-            Self::Verack(_) => "Verack",
-            Self::GetPeers(_) => "GetPeers",
-            Self::Peers(_) => "Peers",
-            Self::Unsupported => "unsupported message",
-        };
-
-        write!(f, "{}", name)
-    }
-}
-
-pub fn prepare_packet<M: Message>(message: &M) -> Bytes {
-    let serialized = message.serialize().unwrap();
-    let header = MessageHeader::new(M::name(), serialized.len() as u32);
+pub fn prepare_packet(payload: &Payload) -> Bytes {
+    let serialized = bincode::serialize(payload).unwrap();
+    let header = MessageHeader {
+        len: serialized.len() as u32,
+    };
 
     let mut ret = Vec::with_capacity(MESSAGE_HEADER_LEN + serialized.len());
-    ret.extend_from_slice(&header.serialize().unwrap());
+    ret.extend_from_slice(&header.as_bytes()[..]);
     ret.extend_from_slice(&serialized);
 
     ret.into()
@@ -136,12 +116,11 @@ macro_rules! unwrap_or_bail {
 
 impl Handshaking for FakeNode {
     fn enable_handshaking(&self) {
-        let (from_node_sender, mut from_node_receiver) = mpsc::channel(1);
-        self.node().set_handshake_handler(from_node_sender.into());
+        let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(1);
 
         // spawn a background task dedicated to handling the handshakes
         let self_clone = self.clone();
-        tokio::spawn(async move {
+        let handshake_task = tokio::spawn(async move {
             loop {
                 if let Some((mut conn, result_sender)) = from_node_receiver.recv().await {
                     let mut locked_peers = self_clone.peers.lock().await;
@@ -164,7 +143,7 @@ impl Handshaking for FakeNode {
 
                             // send own Version
                             let version = self_clone.produce_version(conn.addr);
-                            let packeted = prepare_packet(&version);
+                            let packeted = prepare_packet(&Payload::Version(version));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
                                 result_sender
@@ -178,13 +157,12 @@ impl Handshaking for FakeNode {
                             let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
                             header_arr.copy_from_slice(header);
                             let header = MessageHeader::from(header_arr);
-                            assert_eq!(header.name, Verack::name());
                             let message_len = header.len as usize;
                             let message = unwrap_or_bail!(
                                 conn.reader().read_exact(message_len).await,
                                 result_sender
                             );
-                            unwrap_or_bail!(Verack::deserialize(message), result_sender);
+                            unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
                             // receive a Version
                             let header = unwrap_or_bail!(
@@ -194,25 +172,29 @@ impl Handshaking for FakeNode {
                             let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
                             header_arr.copy_from_slice(header);
                             let header = MessageHeader::from(header_arr);
-                            assert_eq!(header.name, Version::name());
                             let message_len = header.len as usize;
                             let message = unwrap_or_bail!(
                                 conn.reader().read_exact(message_len).await,
                                 result_sender
                             );
                             let peer_version =
-                                unwrap_or_bail!(Version::deserialize(message), result_sender);
+                                unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
                             // send a Verack
                             let nonce = conn.node.listening_addr().port() as u64; // for simplicity
                             let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
-                            let packeted = prepare_packet(&verack);
+                            let packeted = prepare_packet(&Payload::Verack(verack));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
                                 result_sender
                             );
 
-                            peer_version.sender
+                            if let Payload::Version(version) = peer_version {
+                                version.sender
+                            } else {
+                                result_sender.send(Err(io::ErrorKind::Other.into()));
+                                continue;
+                            }
                         }
                         ConnectionSide::Responder => {
                             debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
@@ -225,19 +207,18 @@ impl Handshaking for FakeNode {
                             let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
                             header_arr.copy_from_slice(header);
                             let header = MessageHeader::from(header_arr);
-                            assert_eq!(header.name, Version::name());
                             let message_len = header.len as usize;
                             let message = unwrap_or_bail!(
                                 conn.reader().read_exact(message_len).await,
                                 result_sender
                             );
                             let peer_version =
-                                unwrap_or_bail!(Version::deserialize(message), result_sender);
+                                unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
                             // send a Verack
                             let nonce = conn.node.listening_addr().port() as u64; // for simplicity
                             let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
-                            let packeted = prepare_packet(&verack);
+                            let packeted = prepare_packet(&Payload::Verack(verack));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
                                 result_sender
@@ -245,7 +226,7 @@ impl Handshaking for FakeNode {
 
                             // send own Version
                             let version = self_clone.produce_version(conn.addr);
-                            let packeted = prepare_packet(&version);
+                            let packeted = prepare_packet(&Payload::Version(version));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
                                 result_sender
@@ -259,15 +240,19 @@ impl Handshaking for FakeNode {
                             let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
                             header_arr.copy_from_slice(header);
                             let header = MessageHeader::from(header_arr);
-                            assert_eq!(header.name, Verack::name());
                             let message_len = header.len as usize;
                             let message = unwrap_or_bail!(
                                 conn.reader().read_exact(message_len).await,
                                 result_sender
                             );
-                            unwrap_or_bail!(Verack::deserialize(message), result_sender);
+                            unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
-                            peer_version.sender
+                            if let Payload::Version(version) = peer_version {
+                                version.sender
+                            } else {
+                                result_sender.send(Err(io::ErrorKind::Other.into()));
+                                continue;
+                            }
                         }
                     };
 
@@ -283,6 +268,9 @@ impl Handshaking for FakeNode {
                 }
             }
         });
+
+        self.node()
+            .set_handshake_handler((from_node_sender, handshake_task).into());
     }
 }
 
@@ -304,32 +292,7 @@ impl Reading for FakeNode {
         let message_len = header.len as usize;
 
         // read message payload
-        let message = &buffer[MESSAGE_HEADER_LEN..][..message_len];
-
-        let message = if header.name == Version::name() {
-            info!(parent: self.node().span(), "got a Version from {}", source);
-            SnarkosMessage::Version(
-                Version::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
-            )
-        } else if header.name == Verack::name() {
-            info!(parent: self.node().span(), "got a Verack from {}", source);
-            SnarkosMessage::Verack(
-                Verack::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
-            )
-        } else if header.name == GetPeers::name() {
-            info!(parent: self.node().span(), "got a GetPeers from {}", source);
-            SnarkosMessage::GetPeers(
-                GetPeers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
-            )
-        } else if header.name == Peers::name() {
-            info!(parent: self.node().span(), "got a Peers from {}", source);
-            SnarkosMessage::Peers(
-                Peers::deserialize(message).map_err(|_| io::ErrorKind::InvalidData)?,
-            )
-        } else {
-            info!(parent: self.node().span(), "got an unsupported message from {}", source);
-            SnarkosMessage::Unsupported
-        };
+        let message = bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len]).unwrap();
 
         let full_message = SnarkosFullMessage { header, message };
 
@@ -342,15 +305,15 @@ impl Reading for FakeNode {
         full_message: Self::Message,
     ) -> io::Result<()> {
         let named_response = match full_message.message {
-            SnarkosMessage::Version(_) => {
+            Payload::Version(_) => {
                 // only used for sync purposes post-handshake
                 None
             }
-            SnarkosMessage::Verack(_) => {
+            Payload::Verack(_) => {
                 // only used for the handshake
                 None
             }
-            SnarkosMessage::GetPeers(_) => {
+            Payload::GetPeers => {
                 let peers = self
                     .peers
                     .lock()
@@ -361,7 +324,7 @@ impl Reading for FakeNode {
                     .collect::<Vec<_>>();
 
                 if !peers.is_empty() {
-                    let peers = Peers::new(peers);
+                    let peers = Payload::Peers(peers);
                     let packet = prepare_packet(&peers);
 
                     Some(("Peers", packet))
@@ -369,15 +332,14 @@ impl Reading for FakeNode {
                     None
                 }
             }
-            SnarkosMessage::Peers(peers) => {
+            Payload::Peers(peers) => {
                 // comment out the bootstrapper condition in order for all nodes to keep sending GetPeers requests
                 // if node.name() == "bootstrapper" {
-                if !peers.addresses.is_empty()
+                if !peers.is_empty()
                     && self.node().num_connected() < self.desired_connection_count as usize
                 {
                     // connect to only one candidate at once to avoid maxing the node's connection limit
                     let addr = peers
-                        .addresses
                         .iter()
                         .filter(|&(addr, _)| *addr != self.node().listening_addr())
                         .choose(&mut *RNG.lock())
@@ -391,7 +353,7 @@ impl Reading for FakeNode {
 
                 None
             }
-            SnarkosMessage::Unsupported => None,
+            _ => None,
         };
 
         if let Some((name, response)) = named_response {
@@ -445,7 +407,7 @@ impl FakeNode {
                     // broadcast GetPeers
                     info!(parent: node.span(), "broadcasting GetPeers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
 
-                    let packeted = prepare_packet(&GetPeers);
+                    let packeted = prepare_packet(&Payload::GetPeers);
                     node.send_broadcast(packeted).await.unwrap();
                 } else {
                     debug!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
@@ -456,7 +418,7 @@ impl FakeNode {
                     info!(parent: node.span(), "broadcasting Version");
 
                     let version = self_clone.produce_version("127.0.0.1:9".parse().unwrap()); // the discard protocol port
-                    let packeted = prepare_packet(&version);
+                    let packeted = prepare_packet(&Payload::Version(version));
                     node.send_broadcast(packeted).await.unwrap();
                 }
             }

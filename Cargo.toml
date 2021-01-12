@@ -9,11 +9,13 @@ pea2pea = "0.13"
 snarkos-network = { git = "https://github.com/niklaslong/snarkOS", branch = "refactor/networking" }
 
 async-trait = "0.1"
+bincode = "1"
 bytes = "1"
 chrono = "0.4"
 once_cell = "1"
 parking_lot = "0.11"
 rand = { version = "0.8", features = ["small_rng"] }
+serde = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt-multi-thread", "sync"] }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.2", features = ["ansi", "chrono", "env-filter", "fmt", "parking_lot", "smallvec"] }
