@@ -3,7 +3,6 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex as SyncMutex;
 use rand::{rngs::SmallRng, seq::IteratorRandom, SeedableRng};
-use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, Mutex},
     time::sleep,
@@ -19,7 +18,7 @@ use snarkos_network::external::*;
 
 use std::{
     collections::HashMap,
-    fmt, io,
+    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -137,7 +136,7 @@ impl Handshaking for FakeNode {
                         continue;
                     }
 
-                    let peer_listening_addr = match !conn.side {
+                    let peer_version = match !conn.side {
                         ConnectionSide::Initiator => {
                             debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
 
@@ -189,12 +188,7 @@ impl Handshaking for FakeNode {
                                 result_sender
                             );
 
-                            if let Payload::Version(version) = peer_version {
-                                version.sender
-                            } else {
-                                result_sender.send(Err(io::ErrorKind::Other.into()));
-                                continue;
-                            }
+                            peer_version
                         }
                         ConnectionSide::Responder => {
                             debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
@@ -247,13 +241,19 @@ impl Handshaking for FakeNode {
                             );
                             unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
-                            if let Payload::Version(version) = peer_version {
-                                version.sender
-                            } else {
-                                result_sender.send(Err(io::ErrorKind::Other.into()));
-                                continue;
-                            }
+                            peer_version
                         }
+                    };
+
+                    let peer_listening_addr = if let Payload::Version(version) = peer_version {
+                        version.sender
+                    } else {
+                        if result_sender.send(Err(io::ErrorKind::Other.into())).is_err() {
+                            error!("panic!");
+                            unreachable!();
+                        }
+                        error!("invalid handshake with {}!", conn.addr);
+                        continue;
                     };
 
                     locked_peers.insert(peer_listening_addr, conn.addr);
@@ -280,7 +280,7 @@ impl Reading for FakeNode {
 
     fn read_message(
         &self,
-        source: SocketAddr,
+        _source: SocketAddr,
         buffer: &[u8],
     ) -> io::Result<Option<(Self::Message, usize)>> {
         // parse the header
