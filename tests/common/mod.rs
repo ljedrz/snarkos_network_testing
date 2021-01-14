@@ -19,7 +19,7 @@ use snarkos_network::external::*;
 use std::{
     collections::HashMap,
     io,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -54,13 +54,12 @@ impl From<Node> for FakeNode {
 }
 
 impl FakeNode {
-    fn produce_version(&self, receiver_addr: SocketAddr) -> Version {
+    fn produce_version(&self) -> Version {
         Version::new(
             VERSION,
             self.current_block_height.load(Ordering::SeqCst),
-            self.node.listening_addr().port() as u64, // for simplicity,
-            self.node.listening_addr(),
-            receiver_addr,
+            0, // for simplicity,
+            self.node.listening_addr().port(),
         )
     }
 }
@@ -141,7 +140,7 @@ impl Handshaking for FakeNode {
                             debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
 
                             // send own Version
-                            let version = self_clone.produce_version(conn.addr);
+                            let version = self_clone.produce_version();
                             let packeted = prepare_packet(&Payload::Version(version));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -180,8 +179,8 @@ impl Handshaking for FakeNode {
                                 unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
                             // send a Verack
-                            let nonce = conn.node.listening_addr().port() as u64; // for simplicity
-                            let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
+                            let nonce = 0; // for simplicity
+                            let verack = Verack::new(nonce);
                             let packeted = prepare_packet(&Payload::Verack(verack));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -210,8 +209,8 @@ impl Handshaking for FakeNode {
                                 unwrap_or_bail!(bincode::deserialize(&message), result_sender);
 
                             // send a Verack
-                            let nonce = conn.node.listening_addr().port() as u64; // for simplicity
-                            let verack = Verack::new(nonce, conn.node.listening_addr(), conn.addr);
+                            let nonce = 0; // for simplicity
+                            let verack = Verack::new(nonce);
                             let packeted = prepare_packet(&Payload::Verack(verack));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -219,7 +218,7 @@ impl Handshaking for FakeNode {
                             );
 
                             // send own Version
-                            let version = self_clone.produce_version(conn.addr);
+                            let version = self_clone.produce_version();
                             let packeted = prepare_packet(&Payload::Version(version));
                             unwrap_or_bail!(
                                 conn.writer().write_all(&packeted).await,
@@ -245,10 +244,13 @@ impl Handshaking for FakeNode {
                         }
                     };
 
-                    let peer_listening_addr = if let Payload::Version(version) = peer_version {
-                        version.sender
+                    let peer_listening_port = if let Payload::Version(version) = peer_version {
+                        version.listening_port
                     } else {
-                        if result_sender.send(Err(io::ErrorKind::Other.into())).is_err() {
+                        if result_sender
+                            .send(Err(io::ErrorKind::Other.into()))
+                            .is_err()
+                        {
                             error!("panic!");
                             unreachable!();
                         }
@@ -256,6 +258,8 @@ impl Handshaking for FakeNode {
                         continue;
                     };
 
+                    let peer_listening_addr =
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, peer_listening_port));
                     locked_peers.insert(peer_listening_addr, conn.addr);
 
                     debug!(parent: conn.node.span(), "handshake with {} ({}) was a success", conn.addr, peer_listening_addr);
@@ -417,7 +421,7 @@ impl FakeNode {
                     // broadcast Version
                     info!(parent: node.span(), "broadcasting Version");
 
-                    let version = self_clone.produce_version("127.0.0.1:9".parse().unwrap()); // the discard protocol port
+                    let version = self_clone.produce_version();
                     let packeted = prepare_packet(&Payload::Version(version));
                     node.send_broadcast(packeted).await.unwrap();
                 }
