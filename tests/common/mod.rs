@@ -115,7 +115,9 @@ macro_rules! unwrap_or_bail {
 
 impl Handshaking for FakeNode {
     fn enable_handshaking(&self) {
-        let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(1);
+        let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(
+            self.node().config().protocol_handler_queue_depth,
+        );
 
         // spawn a background task dedicated to handling the handshakes
         let self_clone = self.clone();
@@ -222,7 +224,11 @@ impl Handshaking for FakeNode {
                             );
 
                             // send a Verack
-                            let nonce = 0; // for simplicity
+                            let nonce = if let Payload::Version(ref version) = peer_version {
+                                version.nonce
+                            } else {
+                                unreachable!();
+                            };
                             let verack = Verack::new(nonce);
                             let packeted = prepare_packet(&Payload::Verack(verack));
                             unwrap_or_bail!(
@@ -251,6 +257,7 @@ impl Handshaking for FakeNode {
                                     .await,
                                 result_sender
                             );
+
                             unwrap_or_bail!(
                                 bincode::deserialize(&temp_buffer[..message_len]),
                                 result_sender
@@ -314,8 +321,8 @@ impl Reading for FakeNode {
 
         if buffer[MESSAGE_HEADER_LEN..].len() >= message_len {
             // read message payload
-            let message =
-                bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len]).map_err(|e| {
+            let message = bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len])
+                .map_err(|e| {
                     error!("can't deserialize: {}", e);
                     io::ErrorKind::InvalidData
                 })?;

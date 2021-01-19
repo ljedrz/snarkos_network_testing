@@ -73,7 +73,7 @@ async fn pose_as_bootstrapper_with_peers() {
 
     loop {
         let bootstrapper_peer_count = fake_nodes[0].node().num_connected();
-        if bootstrapper_peer_count < common::DESIRED_CONNECTION_COUNT as usize {
+        if bootstrapper_peer_count < NUM_NON_BOOTSTRAPPERS {
             error!(
                 "the bootstrapper isn't connected to all the fake nodes ({}/{})!",
                 bootstrapper_peer_count,
@@ -97,13 +97,13 @@ async fn pose_as_bootstrapper_with_peers() {
 async fn stress_test_snarkos_bootstrapper() {
     start_logger();
 
-    const NUM_NON_BOOTSTRAPPERS: usize = 50;
+    const NUM_FAKE_NODES: usize = 50;
 
     let config = NodeConfig {
         max_connections: common::DESIRED_CONNECTION_COUNT as u16 + 5,
         ..Default::default()
     };
-    let fake_nodes = start_nodes(NUM_NON_BOOTSTRAPPERS, Some(config)).await;
+    let fake_nodes = start_nodes(NUM_FAKE_NODES, Some(config)).await;
     let fake_nodes = fake_nodes
         .into_iter()
         .map(FakeNode::from)
@@ -117,7 +117,7 @@ async fn stress_test_snarkos_bootstrapper() {
 
     for node in &fake_nodes {
         node.node()
-            .connect("127.0.0.1:4141".parse().unwrap())
+            .connect("0.0.0.0:4141".parse().unwrap())
             .await
             .unwrap();
     }
@@ -154,7 +154,7 @@ async fn single_plain_node() {
 
     fake_node
         .node()
-        .connect("127.0.0.1:4141".parse().unwrap())
+        .connect("0.0.0.0:4141".parse().unwrap())
         .await
         .unwrap();
 
