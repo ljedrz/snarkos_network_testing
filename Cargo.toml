@@ -5,8 +5,8 @@ authors = ["ljedrz <ljedrz@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-pea2pea = "0.14"
-snarkos-network = { git = "https://github.com/niklaslong/snarkOS", branch = "refactor/networking" }
+pea2pea = "0.16"
+snarkos-network = { git = "https://github.com/AleoHQ/snarkOS", branch = "staging" }
 
 async-trait = "0.1"
 bincode = "1"
