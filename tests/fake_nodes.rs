@@ -160,3 +160,21 @@ async fn single_plain_node() {
 
     future::pending::<()>().await;
 }
+
+#[tokio::test]
+async fn single_bootstrapper_node() {
+    start_logger();
+
+    let config = NodeConfig {
+        name: Some("bootstrapper".into()),
+        desired_listening_port: Some(4141),
+        ..Default::default()
+    };
+    let fake_node = FakeNode::from(Node::new(Some(config)).await.unwrap());
+    fake_node.enable_handshaking();
+    fake_node.enable_reading();
+    fake_node.enable_writing();
+    fake_node.run_periodic_maintenance();
+
+    future::pending::<()>().await;
+}

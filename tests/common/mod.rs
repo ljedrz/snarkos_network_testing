@@ -136,7 +136,7 @@ impl Handshaking for FakeNode {
                         continue;
                     }
 
-                    let mut temp_buffer = [0u8; 64];
+                    let mut temp_buffer = [0u8; 128];
 
                     let peer_version = match !conn.side {
                         ConnectionSide::Initiator => {
@@ -239,7 +239,6 @@ impl Handshaking for FakeNode {
                             );
 
                             // receive a Verack
-                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
                             unwrap_or_bail!(
                                 conn.reader().read_exact(&mut header_arr).await,
                                 result_sender
@@ -313,18 +312,24 @@ impl Reading for FakeNode {
         let message_len = header.len as usize;
         trace!("expecting a {}B payload", message_len);
 
-        // read message payload
-        let message =
-            bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len]).map_err(|e| {
-                error!("can't deserialize: {}", e);
-                io::ErrorKind::InvalidData
-            })?;
+        if buffer[MESSAGE_HEADER_LEN..].len() >= message_len {
+            // read message payload
+            let message =
+                bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len]).map_err(|e| {
+                    error!("can't deserialize: {}", e);
+                    io::ErrorKind::InvalidData
+                })?;
 
-        trace!("payload read successfully");
+            let full_message = SnarkosFullMessage { header, message };
 
-        let full_message = SnarkosFullMessage { header, message };
+            trace!("payload read successfully");
 
-        Ok(Some((full_message, MESSAGE_HEADER_LEN + message_len)))
+            Ok(Some((full_message, MESSAGE_HEADER_LEN + message_len)))
+        } else {
+            trace!("incomplete payload read");
+
+            Ok(None)
+        }
     }
 
     async fn process_message(
