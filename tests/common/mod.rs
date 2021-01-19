@@ -11,7 +11,7 @@ use tokio::{
 use tracing::*;
 
 use pea2pea::{
-    connections::ConnectionSide,
+    connections::{Connection, ConnectionSide},
     protocols::{Handshaking, Reading, ReturnableConnection, Writing},
     *,
 };
@@ -63,6 +63,112 @@ impl FakeNode {
             self.node.listening_addr().port(),
         )
     }
+
+    async fn perform_handshake(&self, conn: &mut Connection) -> io::Result<SocketAddr> {
+        let mut locked_peers = self.peers.lock().await;
+        // extra safeguard against double connections
+        if locked_peers.contains_key(&conn.addr) {
+            return Err(io::ErrorKind::Other.into());
+        }
+
+        let mut temp_buffer = [0u8; 128];
+
+        let peer_listening_port = match !conn.side {
+            ConnectionSide::Initiator => {
+                debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
+
+                // send own Version
+                let version = self.produce_version();
+                let packeted = prepare_packet(&Payload::Version(version));
+                conn.writer().write_all(&packeted).await?;
+
+                // receive a Verack
+                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                conn.reader().read_exact(&mut header_arr).await?;
+                let header = MessageHeader::from(header_arr);
+                let message_len = header.len as usize;
+                conn.reader()
+                    .read_exact(&mut temp_buffer[..message_len])
+                    .await?;
+                bincode::deserialize(&temp_buffer[..message_len])
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+
+                // receive a Version
+                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                conn.reader().read_exact(&mut header_arr).await?;
+                let header = MessageHeader::from(header_arr);
+                let message_len = header.len as usize;
+                conn.reader()
+                    .read_exact(&mut temp_buffer[..message_len])
+                    .await?;
+                let peer_version = bincode::deserialize(&temp_buffer[..message_len])
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+                let peer_port = if let Payload::Version(ref version) = peer_version {
+                    version.listening_port
+                } else {
+                    return Err(io::ErrorKind::InvalidData.into());
+                };
+
+                // send a Verack
+                let nonce = 0; // for simplicity
+                let verack = Verack::new(nonce);
+                let packeted = prepare_packet(&Payload::Verack(verack));
+                conn.writer().write_all(&packeted).await?;
+
+                peer_port
+            }
+            ConnectionSide::Responder => {
+                debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
+
+                // receive a Version
+                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
+                conn.reader().read_exact(&mut header_arr).await?;
+                let header = MessageHeader::from(header_arr);
+                let message_len = header.len as usize;
+                conn.reader()
+                    .read_exact(&mut temp_buffer[..message_len])
+                    .await?;
+                let peer_version = bincode::deserialize(&temp_buffer[..message_len])
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+
+                // send a Verack
+                let (peer_port, nonce) = if let Payload::Version(ref version) = peer_version {
+                    (version.listening_port, version.nonce)
+                } else {
+                    return Err(io::ErrorKind::InvalidData.into());
+                };
+                let verack = Verack::new(nonce);
+                let packeted = prepare_packet(&Payload::Verack(verack));
+                conn.writer().write_all(&packeted).await?;
+
+                // send own Version
+                let version = self.produce_version();
+                let packeted = prepare_packet(&Payload::Version(version));
+                conn.writer().write_all(&packeted).await?;
+
+                // receive a Verack
+                conn.reader().read_exact(&mut header_arr).await?;
+                let header = MessageHeader::from(header_arr);
+                let message_len = header.len as usize;
+                conn.reader()
+                    .read_exact(&mut temp_buffer[..message_len])
+                    .await?;
+                let verack = bincode::deserialize(&temp_buffer[..message_len])
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+                if !matches!(verack, Payload::Verack(_)) {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+
+                peer_port
+            }
+        };
+
+        let peer_listening_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, peer_listening_port));
+
+        locked_peers.insert(peer_listening_addr, conn.addr);
+
+        Ok(peer_listening_addr)
+    }
 }
 
 impl Pea2Pea for FakeNode {
@@ -90,29 +196,6 @@ pub fn prepare_packet(payload: &Payload) -> Bytes {
     ret.into()
 }
 
-macro_rules! unwrap_or_bail {
-    ($action: expr, $sender: expr) => {{
-        let ret = $action;
-
-        match ret {
-            Ok(ret) => ret,
-            Err(_) => {
-                let err = io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "already connected, not handshaking",
-                );
-
-                if $sender.send(Err(err)).is_err() {
-                    error!("\npanic!\n");
-                    unreachable!(); // can't recover if this happens
-                }
-
-                continue;
-            }
-        }
-    }};
-}
-
 impl Handshaking for FakeNode {
     fn enable_handshaking(&self) {
         let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(
@@ -124,173 +207,22 @@ impl Handshaking for FakeNode {
         let handshake_task = tokio::spawn(async move {
             loop {
                 if let Some((mut conn, result_sender)) = from_node_receiver.recv().await {
-                    let mut locked_peers = self_clone.peers.lock().await;
-                    // extra safeguard against double connections
-                    if locked_peers.contains_key(&conn.addr) {
-                        let err = io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "already connected, not handshaking",
-                        );
-                        if result_sender.send(Err(err)).is_err() {
-                            error!("\npanic!\n");
-                            unreachable!(); // can't recover if this happens
+                    match self_clone.perform_handshake(&mut conn).await {
+                        Ok(peer_listening_addr) => {
+                            debug!(parent: conn.node.span(), "handshake with {} ({}) was a success", conn.addr, peer_listening_addr);
+
+                            // return the Connection to the node
+                            if result_sender.send(Ok(conn)).is_err() {
+                                error!("\npanic!\n");
+                                unreachable!(); // can't recover if this happens
+                            }
                         }
-                        continue;
-                    }
-
-                    let mut temp_buffer = [0u8; 128];
-
-                    let peer_version = match !conn.side {
-                        ConnectionSide::Initiator => {
-                            debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
-
-                            // send own Version
-                            let version = self_clone.produce_version();
-                            let packeted = prepare_packet(&Payload::Version(version));
-                            unwrap_or_bail!(
-                                conn.writer().write_all(&packeted).await,
-                                result_sender
-                            );
-
-                            // receive a Verack
-                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                            unwrap_or_bail!(
-                                conn.reader().read_exact(&mut header_arr).await,
-                                result_sender
-                            );
-                            let header = MessageHeader::from(header_arr);
-                            let message_len = header.len as usize;
-                            unwrap_or_bail!(
-                                conn.reader()
-                                    .read_exact(&mut temp_buffer[..message_len])
-                                    .await,
-                                result_sender
-                            );
-                            unwrap_or_bail!(
-                                bincode::deserialize(&temp_buffer[..message_len]),
-                                result_sender
-                            );
-
-                            // receive a Version
-                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                            unwrap_or_bail!(
-                                conn.reader().read_exact(&mut header_arr).await,
-                                result_sender
-                            );
-                            let header = MessageHeader::from(header_arr);
-                            let message_len = header.len as usize;
-                            unwrap_or_bail!(
-                                conn.reader()
-                                    .read_exact(&mut temp_buffer[..message_len])
-                                    .await,
-                                result_sender
-                            );
-                            let peer_version = unwrap_or_bail!(
-                                bincode::deserialize(&temp_buffer[..message_len]),
-                                result_sender
-                            );
-
-                            // send a Verack
-                            let nonce = 0; // for simplicity
-                            let verack = Verack::new(nonce);
-                            let packeted = prepare_packet(&Payload::Verack(verack));
-                            unwrap_or_bail!(
-                                conn.writer().write_all(&packeted).await,
-                                result_sender
-                            );
-
-                            peer_version
+                        Err(e) => {
+                            if result_sender.send(Err(e)).is_err() {
+                                error!("\npanic!\n");
+                                unreachable!(); // can't recover if this happens
+                            }
                         }
-                        ConnectionSide::Responder => {
-                            debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
-
-                            // receive a Version
-                            let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                            unwrap_or_bail!(
-                                conn.reader().read_exact(&mut header_arr).await,
-                                result_sender
-                            );
-                            let header = MessageHeader::from(header_arr);
-                            let message_len = header.len as usize;
-                            unwrap_or_bail!(
-                                conn.reader()
-                                    .read_exact(&mut temp_buffer[..message_len])
-                                    .await,
-                                result_sender
-                            );
-                            let peer_version = unwrap_or_bail!(
-                                bincode::deserialize(&temp_buffer[..message_len]),
-                                result_sender
-                            );
-
-                            // send a Verack
-                            let nonce = if let Payload::Version(ref version) = peer_version {
-                                version.nonce
-                            } else {
-                                unreachable!();
-                            };
-                            let verack = Verack::new(nonce);
-                            let packeted = prepare_packet(&Payload::Verack(verack));
-                            unwrap_or_bail!(
-                                conn.writer().write_all(&packeted).await,
-                                result_sender
-                            );
-
-                            // send own Version
-                            let version = self_clone.produce_version();
-                            let packeted = prepare_packet(&Payload::Version(version));
-                            unwrap_or_bail!(
-                                conn.writer().write_all(&packeted).await,
-                                result_sender
-                            );
-
-                            // receive a Verack
-                            unwrap_or_bail!(
-                                conn.reader().read_exact(&mut header_arr).await,
-                                result_sender
-                            );
-                            let header = MessageHeader::from(header_arr);
-                            let message_len = header.len as usize;
-                            unwrap_or_bail!(
-                                conn.reader()
-                                    .read_exact(&mut temp_buffer[..message_len])
-                                    .await,
-                                result_sender
-                            );
-
-                            unwrap_or_bail!(
-                                bincode::deserialize(&temp_buffer[..message_len]),
-                                result_sender
-                            );
-
-                            peer_version
-                        }
-                    };
-
-                    let peer_listening_port = if let Payload::Version(version) = peer_version {
-                        version.listening_port
-                    } else {
-                        if result_sender
-                            .send(Err(io::ErrorKind::Other.into()))
-                            .is_err()
-                        {
-                            error!("panic!");
-                            unreachable!();
-                        }
-                        error!("invalid handshake with {}!", conn.addr);
-                        continue;
-                    };
-
-                    let peer_listening_addr =
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, peer_listening_port));
-                    locked_peers.insert(peer_listening_addr, conn.addr);
-
-                    debug!(parent: conn.node.span(), "handshake with {} ({}) was a success", conn.addr, peer_listening_addr);
-
-                    // return the Connection to the node
-                    if result_sender.send(Ok(conn)).is_err() {
-                        error!("\npanic!\n");
-                        unreachable!(); // can't recover if this happens
                     }
                 }
             }
@@ -317,7 +249,6 @@ impl Reading for FakeNode {
 
         // read payload length
         let message_len = header.len as usize;
-        trace!("expecting a {}B payload", message_len);
 
         if buffer[MESSAGE_HEADER_LEN..].len() >= message_len {
             // read message payload
@@ -329,12 +260,8 @@ impl Reading for FakeNode {
 
             let full_message = SnarkosFullMessage { header, message };
 
-            trace!("payload read successfully");
-
             Ok(Some((full_message, MESSAGE_HEADER_LEN + message_len)))
         } else {
-            trace!("incomplete payload read");
-
             Ok(None)
         }
     }
