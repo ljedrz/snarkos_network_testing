@@ -1,24 +1,23 @@
 use bytes::Bytes;
-use chrono::Utc;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex as SyncMutex;
+use parking_lot::{RwLock, Mutex as SyncMutex};
 use rand::{rngs::SmallRng, seq::IteratorRandom, SeedableRng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, Mutex},
+    sync::Mutex,
     time::sleep,
 };
 use tracing::*;
 
 use pea2pea::{
     connections::{Connection, ConnectionSide},
-    protocols::{Handshaking, Reading, ReturnableConnection, Writing},
+    protocols::{Handshaking, Reading, Writing},
     *,
 };
 use snarkos_network::external::*;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{Ipv4Addr, SocketAddr},
     sync::{
@@ -31,14 +30,14 @@ use std::{
 pub const DESIRED_CONNECTION_COUNT: u8 = 5;
 pub static RNG: Lazy<SyncMutex<SmallRng>> = Lazy::new(|| SyncMutex::new(SmallRng::from_entropy()));
 
-const VERSION: u64 = 1;
 const MESSAGE_HEADER_LEN: usize = 4;
 
 #[derive(Clone)]
 pub struct FakeNode {
     pub node: Node,
     // a map of listening addresses to the actual addresses of connected nodes
-    pub peers: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+    pub peers: Arc<Mutex<HashSet<SocketAddr>>>,
+    pub handshakes: Arc<RwLock<HashMap<SocketAddr, Arc<SyncMutex<snow::TransportState>>>>>,
     pub desired_connection_count: u8,
     pub current_block_height: Arc<AtomicU32>,
 }
@@ -48,126 +47,10 @@ impl From<Node> for FakeNode {
         Self {
             node,
             peers: Default::default(),
+            handshakes: Default::default(),
             desired_connection_count: DESIRED_CONNECTION_COUNT,
             current_block_height: Default::default(),
         }
-    }
-}
-
-impl FakeNode {
-    fn produce_version(&self) -> Version {
-        Version::new(
-            VERSION,
-            self.current_block_height.load(Ordering::SeqCst),
-            0, // for simplicity,
-            self.node.listening_addr().port(),
-        )
-    }
-
-    async fn perform_handshake(&self, conn: &mut Connection) -> io::Result<SocketAddr> {
-        let mut locked_peers = self.peers.lock().await;
-        // extra safeguard against double connections
-        if locked_peers.contains_key(&conn.addr) {
-            return Err(io::ErrorKind::Other.into());
-        }
-
-        let mut temp_buffer = [0u8; 128];
-
-        let peer_listening_port = match !conn.side {
-            ConnectionSide::Initiator => {
-                debug!(parent: conn.node.span(), "handshaking with {} as the initiator", conn.addr);
-
-                // send own Version
-                let version = self.produce_version();
-                let packeted = prepare_packet(&Payload::Version(version));
-                conn.writer().write_all(&packeted).await?;
-
-                // receive a Verack
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                conn.reader().read_exact(&mut header_arr).await?;
-                let header = MessageHeader::from(header_arr);
-                let message_len = header.len as usize;
-                conn.reader()
-                    .read_exact(&mut temp_buffer[..message_len])
-                    .await?;
-                bincode::deserialize(&temp_buffer[..message_len])
-                    .map_err(|_| io::ErrorKind::InvalidData)?;
-
-                // receive a Version
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                conn.reader().read_exact(&mut header_arr).await?;
-                let header = MessageHeader::from(header_arr);
-                let message_len = header.len as usize;
-                conn.reader()
-                    .read_exact(&mut temp_buffer[..message_len])
-                    .await?;
-                let peer_version = bincode::deserialize(&temp_buffer[..message_len])
-                    .map_err(|_| io::ErrorKind::InvalidData)?;
-                let peer_port = if let Payload::Version(ref version) = peer_version {
-                    version.listening_port
-                } else {
-                    return Err(io::ErrorKind::InvalidData.into());
-                };
-
-                // send a Verack
-                let nonce = 0; // for simplicity
-                let verack = Verack::new(nonce);
-                let packeted = prepare_packet(&Payload::Verack(verack));
-                conn.writer().write_all(&packeted).await?;
-
-                peer_port
-            }
-            ConnectionSide::Responder => {
-                debug!(parent: conn.node.span(), "handshaking with {} as the responder", conn.addr);
-
-                // receive a Version
-                let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-                conn.reader().read_exact(&mut header_arr).await?;
-                let header = MessageHeader::from(header_arr);
-                let message_len = header.len as usize;
-                conn.reader()
-                    .read_exact(&mut temp_buffer[..message_len])
-                    .await?;
-                let peer_version = bincode::deserialize(&temp_buffer[..message_len])
-                    .map_err(|_| io::ErrorKind::InvalidData)?;
-
-                // send a Verack
-                let (peer_port, nonce) = if let Payload::Version(ref version) = peer_version {
-                    (version.listening_port, version.nonce)
-                } else {
-                    return Err(io::ErrorKind::InvalidData.into());
-                };
-                let verack = Verack::new(nonce);
-                let packeted = prepare_packet(&Payload::Verack(verack));
-                conn.writer().write_all(&packeted).await?;
-
-                // send own Version
-                let version = self.produce_version();
-                let packeted = prepare_packet(&Payload::Version(version));
-                conn.writer().write_all(&packeted).await?;
-
-                // receive a Verack
-                conn.reader().read_exact(&mut header_arr).await?;
-                let header = MessageHeader::from(header_arr);
-                let message_len = header.len as usize;
-                conn.reader()
-                    .read_exact(&mut temp_buffer[..message_len])
-                    .await?;
-                let verack = bincode::deserialize(&temp_buffer[..message_len])
-                    .map_err(|_| io::ErrorKind::InvalidData)?;
-                if !matches!(verack, Payload::Verack(_)) {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-
-                peer_port
-            }
-        };
-
-        let peer_listening_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, peer_listening_port));
-
-        locked_peers.insert(peer_listening_addr, conn.addr);
-
-        Ok(peer_listening_addr)
     }
 }
 
@@ -180,56 +63,116 @@ impl Pea2Pea for FakeNode {
 #[derive(Debug)]
 pub struct SnarkosFullMessage {
     header: MessageHeader,
-    message: Payload,
+    payload: Payload,
 }
 
 pub fn prepare_packet(payload: &Payload) -> Bytes {
-    let serialized = bincode::serialize(payload).unwrap();
-    let header = MessageHeader {
-        len: serialized.len() as u32,
-    };
-
-    let mut ret = Vec::with_capacity(MESSAGE_HEADER_LEN + serialized.len());
-    ret.extend_from_slice(&header.as_bytes()[..]);
-    ret.extend_from_slice(&serialized);
-
-    ret.into()
+    bincode::serialize(payload).unwrap().into()
 }
 
+#[async_trait::async_trait]
 impl Handshaking for FakeNode {
-    fn enable_handshaking(&self) {
-        let (from_node_sender, mut from_node_receiver) = mpsc::channel::<ReturnableConnection>(
-            self.node().config().protocol_handler_queue_depth,
-        );
+    async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
+        let mut locked_peers = self.peers.lock().await;
+        // extra safeguard against double connections
+        if locked_peers.contains(&conn.addr) {
+            return Err(io::ErrorKind::Other.into());
+        }
 
-        // spawn a background task dedicated to handling the handshakes
-        let self_clone = self.clone();
-        let handshake_task = tokio::spawn(async move {
-            loop {
-                if let Some((mut conn, result_sender)) = from_node_receiver.recv().await {
-                    match self_clone.perform_handshake(&mut conn).await {
-                        Ok(peer_listening_addr) => {
-                            debug!(parent: conn.node.span(), "handshake with {} ({}) was a success", conn.addr, peer_listening_addr);
+        let (noise, peer_listening_port) = match !conn.side {
+            ConnectionSide::Initiator => {
+                let builder = snow::Builder::with_resolver(
+                    snarkos_network::HANDSHAKE_PATTERN
+                        .parse()
+                        .expect("Invalid noise handshake pattern!"),
+                    Box::new(snow::resolvers::SodiumResolver),
+                );
+                let static_key = builder.generate_keypair().unwrap().private;
+                let noise_builder = builder.local_private_key(&static_key).psk(3, snarkos_network::HANDSHAKE_PSK);
+                let mut noise = noise_builder.build_initiator().unwrap();
+                let mut buffer: Box<[u8]> = vec![0u8; snarkos_network::MAX_MESSAGE_SIZE].into();
+                let mut buf = [0u8; snarkos_network::NOISE_BUF_LEN]; // a temporary intermediate buffer to decrypt from
 
-                            // return the Connection to the node
-                            if result_sender.send(Ok(conn)).is_err() {
-                                error!("\npanic!\n");
-                                unreachable!(); // can't recover if this happens
-                            }
-                        }
-                        Err(e) => {
-                            if result_sender.send(Err(e)).is_err() {
-                                error!("\npanic!\n");
-                                unreachable!(); // can't recover if this happens
-                            }
-                        }
-                    }
-                }
+                // -> e
+                let len = noise.write_message(&[], &mut buffer).unwrap();
+                println!("len: {}", len);
+                conn.writer().write_all(&[len as u8]).await?;
+                conn.writer().write_all(&buffer[..len]).await?;
+                trace!("sent e (XX handshake part 1/3)");
+
+                // <- e, ee, s, es
+                conn.reader().read_exact(&mut buf[..1]).await?;
+                let len = buf[0] as usize;
+                let len = conn.reader().read_exact(&mut buf[..len]).await?;
+                let len = noise
+                    .read_message(&buf[..len], &mut buffer)
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+                let peer_version: Version =
+                    bincode::deserialize(&buffer[..len]).map_err(|_| io::ErrorKind::InvalidData)?;
+                trace!("received e, ee, s, es (XX handshake part 2/3)");
+
+                // -> s, se, psk
+                let own_version = bincode::serialize(&Version::new(1u64, conn.node.listening_addr().port())).unwrap();
+                let len = noise
+                    .write_message(&own_version, &mut buffer)
+                    .unwrap();
+                conn.writer().write_all(&[len as u8]).await?;
+                conn.writer().write_all(&buffer[..len]).await?;
+                trace!("sent s, se, psk (XX handshake part 3/3)");
+
+                (noise, peer_version.listening_port)
             }
-        });
+            ConnectionSide::Responder => {
+                let builder = snow::Builder::with_resolver(
+                    snarkos_network::HANDSHAKE_PATTERN
+                        .parse()
+                        .expect("Invalid noise handshake pattern!"),
+                    Box::new(snow::resolvers::SodiumResolver),
+                );
+                let static_key = builder.generate_keypair().unwrap().private;
+                let noise_builder = builder.local_private_key(&static_key).psk(3, snarkos_network::HANDSHAKE_PSK);
+                let mut noise = noise_builder.build_responder().unwrap();
+                let mut buffer: Box<[u8]> = vec![0u8; snarkos_network::MAX_MESSAGE_SIZE].into();
+                let mut buf = [0u8; snarkos_network::NOISE_BUF_LEN]; // a temporary intermediate buffer to decrypt from
 
-        self.node()
-            .set_handshake_handler((from_node_sender, handshake_task).into());
+                // <- e
+                conn.reader().read_exact(&mut buf[..1]).await?;
+                let len = buf[0] as usize;
+                let len = conn.reader().read_exact(&mut buf[..len]).await?;
+                noise
+                    .read_message(&buf[..len], &mut buffer)
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+                trace!("received e (XX handshake part 1/3)");
+
+                // -> e, ee, s, es
+                let own_version = bincode::serialize(&Version::new(1u64, conn.node.listening_addr().port())).unwrap();
+                let len = noise
+                    .write_message(&own_version, &mut buffer)
+                    .unwrap();
+                conn.writer().write_all(&[len as u8]).await?;
+                conn.writer().write_all(&buffer[..len]).await?;
+                trace!("sent e, ee, s, es (XX handshake part 2/3)");
+
+                // <- s, se, psk
+                conn.reader().read_exact(&mut buf[..1]).await?;
+                let len = buf[0] as usize;
+                let len = conn.reader().read_exact(&mut buf[..len]).await?;
+                let len = noise
+                    .read_message(&buf[..len], &mut buffer)
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
+                let peer_version: Version = bincode::deserialize(&buffer[..len]).map_err(|_| io::ErrorKind::InvalidData)?;
+                trace!("received s, se, psk (XX handshake part 3/3)");
+
+                (noise, peer_version.listening_port)
+            }
+        };
+
+        let peer_listening_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, peer_listening_port));
+
+        locked_peers.insert(peer_listening_addr);
+        self.handshakes.write().insert(conn.addr, Arc::new(SyncMutex::new(noise.into_transport_mode().unwrap())));
+
+        Ok(conn)
     }
 }
 
@@ -239,7 +182,7 @@ impl Reading for FakeNode {
 
     fn read_message(
         &self,
-        _source: SocketAddr,
+        source: SocketAddr,
         buffer: &[u8],
     ) -> io::Result<Option<(Self::Message, usize)>> {
         // parse the header
@@ -248,19 +191,35 @@ impl Reading for FakeNode {
         let header = MessageHeader::from(header_arr);
 
         // read payload length
-        let message_len = header.len as usize;
+        let payload_len = header.len as usize;
 
-        if buffer[MESSAGE_HEADER_LEN..].len() >= message_len {
-            // read message payload
-            let message = bincode::deserialize(&buffer[MESSAGE_HEADER_LEN..][..message_len])
-                .map_err(|e| {
-                    error!("can't deserialize: {}", e);
-                    io::ErrorKind::InvalidData
-                })?;
+        // re-slice the buffer, advancing it post-header for simplicity
+        let buffer = &buffer[MESSAGE_HEADER_LEN..];
 
-            let full_message = SnarkosFullMessage { header, message };
+        // the easy way
+        let mut decrypted = vec![0u8; payload_len];
 
-            Ok(Some((full_message, MESSAGE_HEADER_LEN + message_len)))
+        if buffer.len() >= payload_len {
+            let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
+            let noise = &mut *noise.lock();
+
+            let mut decrypted_len = 0;
+            let mut processed_len = 0;
+
+            while processed_len < payload_len {
+                let chunk_len = std::cmp::min(snarkos_network::NOISE_BUF_LEN, payload_len - processed_len);
+
+                decrypted_len += noise
+                    .read_message(&buffer[processed_len..][..chunk_len], &mut decrypted[decrypted_len..])
+                    .unwrap();
+                processed_len += chunk_len;
+            }
+
+            let payload = bincode::deserialize(&decrypted).map_err(|_| io::ErrorKind::InvalidData)?;
+
+            let full_message = SnarkosFullMessage { header, payload };
+
+            Ok(Some((full_message, MESSAGE_HEADER_LEN + payload_len)))
         } else {
             Ok(None)
         }
@@ -271,23 +230,15 @@ impl Reading for FakeNode {
         source: SocketAddr,
         full_message: Self::Message,
     ) -> io::Result<()> {
-        let named_response = match full_message.message {
-            Payload::Version(_) => {
-                // only used for sync purposes post-handshake
-                None
-            }
-            Payload::Verack(_) => {
-                // only used for the handshake
-                None
-            }
+        let named_response = match full_message.payload {
             Payload::GetPeers => {
                 let peers = self
                     .peers
                     .lock()
                     .await
-                    .keys()
-                    .filter(|&addr| *addr != source)
-                    .map(|addr| (*addr, Utc::now()))
+                    .iter()
+                    .copied()
+                    .filter(|&addr| addr != source)
                     .collect::<Vec<_>>();
 
                 if !peers.is_empty() {
@@ -308,10 +259,10 @@ impl Reading for FakeNode {
                     // connect to only one candidate at once to avoid maxing the node's connection limit
                     let addr = peers
                         .iter()
-                        .filter(|&(addr, _)| *addr != self.node().listening_addr())
+                        .copied()
+                        .filter(|&addr| addr != self.node().listening_addr())
                         .choose(&mut *RNG.lock())
-                        .unwrap()
-                        .0;
+                        .unwrap();
                     if let Err(e) = self.node().connect(addr).await {
                         error!(parent: self.node().span(), "couldn't connect to {}: {}", addr, e);
                     }
@@ -319,6 +270,11 @@ impl Reading for FakeNode {
                 // }
 
                 None
+            }
+            Payload::Ping(block_height) => {
+                let packet = prepare_packet(&Payload::Pong);
+
+                Some(("Pong", packet))
             }
             _ => None,
         };
@@ -337,10 +293,34 @@ impl Reading for FakeNode {
 }
 
 impl Writing for FakeNode {
-    fn write_message(&self, _: SocketAddr, payload: &[u8], buffer: &mut [u8]) -> io::Result<usize> {
-        buffer[..payload.len()].copy_from_slice(payload);
+    fn write_message(&self, source: SocketAddr, payload: &[u8], buffer: &mut [u8]) -> io::Result<usize> {
+        let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
+        let noise = &mut *noise.lock();
 
-        Ok(payload.len())
+        // make room for the length
+        buffer[..MESSAGE_HEADER_LEN].copy_from_slice(&[0, 0, 0, 0]);
+
+        let mut encrypted_len = MESSAGE_HEADER_LEN;
+        let mut processed_len = 0;
+
+        while processed_len < payload.len() {
+            let chunk_len = std::cmp::min(
+                snarkos_network::NOISE_BUF_LEN - snarkos_network::NOISE_TAG_LEN,
+                payload[processed_len..].len(),
+            );
+            let chunk = &payload[processed_len..][..chunk_len];
+
+            encrypted_len += noise
+                .write_message(chunk, &mut buffer[encrypted_len..])
+                .unwrap();
+            processed_len += chunk_len;
+        }
+        encrypted_len -= MESSAGE_HEADER_LEN;
+
+        let header = MessageHeader::from(encrypted_len);
+        buffer[..MESSAGE_HEADER_LEN].copy_from_slice(&header.as_bytes()[..]);
+
+        Ok(MESSAGE_HEADER_LEN + encrypted_len)
     }
 }
 
@@ -382,11 +362,10 @@ impl FakeNode {
                 }
 
                 if num_connected != 0 {
-                    // broadcast Version
-                    info!(parent: node.span(), "broadcasting Version");
+                    // broadcast Ping
+                    info!(parent: node.span(), "broadcasting Pings");
 
-                    let version = self_clone.produce_version();
-                    let packeted = prepare_packet(&Payload::Version(version));
+                    let packeted = prepare_packet(&Payload::Ping(self_clone.current_block_height.load(Ordering::SeqCst)));
                     node.send_broadcast(packeted).await.unwrap();
                 }
             }
