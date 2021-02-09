@@ -1,9 +1,8 @@
-mod common;
-use common::*;
 use pea2pea::{
     protocols::{Handshaking, Reading, Writing},
     *,
 };
+use snarkos_network_testing::*;
 use tokio::time::sleep;
 use tracing::*;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
@@ -49,7 +48,7 @@ async fn pose_as_bootstrapper_with_peers() {
     let fake_bootstrapper = Node::new(Some(config)).await.unwrap();
 
     let config = NodeConfig {
-        max_connections: common::DESIRED_CONNECTION_COUNT as u16 + 5,
+        max_connections: DESIRED_CONNECTION_COUNT as u16 + 5,
         ..Default::default()
     };
     let fake_nodes = start_nodes(NUM_NON_BOOTSTRAPPERS, Some(config)).await;
@@ -77,14 +76,14 @@ async fn pose_as_bootstrapper_with_peers() {
             error!(
                 "the bootstrapper isn't connected to all the fake nodes ({}/{})!",
                 bootstrapper_peer_count,
-                common::DESIRED_CONNECTION_COUNT
+                DESIRED_CONNECTION_COUNT
             );
         }
         /*
                 if fake_nodes
                     .iter()
                     .skip(1)
-                    .any(|fake| fake.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
+                    .any(|fake| fake.node().num_connected() < DESIRED_CONNECTION_COUNT as usize)
                 {
                     error!("not all the peers have the desired number of peers!");
                 }
@@ -100,7 +99,7 @@ async fn stress_test_snarkos_bootstrapper() {
     const NUM_FAKE_NODES: usize = 50;
 
     let config = NodeConfig {
-        max_connections: common::DESIRED_CONNECTION_COUNT as u16 + 5,
+        max_connections: DESIRED_CONNECTION_COUNT as u16 + 5,
         ..Default::default()
     };
     let fake_nodes = start_nodes(NUM_FAKE_NODES, Some(config)).await;
@@ -130,11 +129,11 @@ async fn stress_test_snarkos_bootstrapper() {
     loop {
         if fake_nodes
             .iter()
-            .any(|node| node.node().num_connected() < common::DESIRED_CONNECTION_COUNT as usize)
+            .any(|node| node.node().num_connected() < DESIRED_CONNECTION_COUNT as usize)
         {
             error!(
                 "a fake node doesn't have the desired number of peers ({})!",
-                common::DESIRED_CONNECTION_COUNT
+                DESIRED_CONNECTION_COUNT
             );
         }
 
