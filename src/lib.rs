@@ -215,7 +215,7 @@ impl Reading for FakeNode {
                         &buffer[processed_len..][..chunk_len],
                         &mut decrypted[decrypted_len..],
                     )
-                    .unwrap();
+                    .map_err(|_| io::ErrorKind::InvalidData)?;
                 processed_len += chunk_len;
             }
 
@@ -241,9 +241,7 @@ impl Reading for FakeNode {
                     .collect::<Vec<_>>();
 
                 if !peers.is_empty() {
-                    let peers = Payload::Peers(peers);
-
-                    Some(peers)
+                    Some(Payload::Peers(peers))
                 } else {
                     None
                 }
@@ -267,17 +265,14 @@ impl Reading for FakeNode {
 
                 None
             }
-            Payload::Ping(block_height) => Some(Payload::Pong),
+            Payload::Ping(_block_height) => Some(Payload::Pong),
             _ => None,
         };
 
         if let Some(response) = response {
             let packet = prepare_packet(&response);
 
-            self.node()
-                .send_direct_message(source, packet)
-                .await
-                .unwrap();
+            let _ = self.node().send_direct_message(source, packet).await;
 
             info!(parent: self.node().span(), "sent a {} to {}", response, source);
         }
@@ -342,7 +337,7 @@ impl FakeNode {
                     info!(parent: node.span(), "broadcasting requests for peers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
 
                     let packeted = prepare_packet(&Payload::GetPeers);
-                    node.send_broadcast(packeted).await.unwrap();
+                    let _ = node.send_broadcast(packeted).await;
                 } else {
                     trace!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
                 }
@@ -354,7 +349,7 @@ impl FakeNode {
                     let packeted = prepare_packet(&Payload::Ping(
                         self_clone.current_block_height.load(Ordering::SeqCst),
                     ));
-                    node.send_broadcast(packeted).await.unwrap();
+                    let _ = node.send_broadcast(packeted).await;
                 }
             }
         });
