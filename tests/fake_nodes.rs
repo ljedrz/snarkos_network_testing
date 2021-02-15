@@ -75,8 +75,7 @@ async fn pose_as_bootstrapper_with_peers() {
         if bootstrapper_peer_count < NUM_NON_BOOTSTRAPPERS {
             error!(
                 "the bootstrapper isn't connected to all the fake nodes ({}/{})!",
-                bootstrapper_peer_count,
-                DESIRED_CONNECTION_COUNT
+                bootstrapper_peer_count, DESIRED_CONNECTION_COUNT
             );
         }
         /*
@@ -85,7 +84,7 @@ async fn pose_as_bootstrapper_with_peers() {
                     .skip(1)
                     .any(|fake| fake.node().num_connected() < DESIRED_CONNECTION_COUNT as usize)
                 {
-                    error!("not all the peers have the desired number of peers!");
+                    warn!("not all the peers have the desired number of peers!");
                 }
         */
         sleep(Duration::from_secs(5)).await;
@@ -131,7 +130,7 @@ async fn stress_test_snarkos_bootstrapper() {
             .iter()
             .any(|node| node.node().num_connected() < DESIRED_CONNECTION_COUNT as usize)
         {
-            error!(
+            warn!(
                 "a fake node doesn't have the desired number of peers ({})!",
                 DESIRED_CONNECTION_COUNT
             );
