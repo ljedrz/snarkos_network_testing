@@ -60,12 +60,6 @@ impl Pea2Pea for FakeNode {
     }
 }
 
-#[derive(Debug)]
-pub struct SnarkosFullMessage {
-    header: MessageHeader,
-    payload: Payload,
-}
-
 pub fn prepare_packet(payload: &Payload) -> Bytes {
     Payload::serialize(payload).unwrap().into()
 }
@@ -184,7 +178,7 @@ impl Handshaking for FakeNode {
 
 #[async_trait::async_trait]
 impl Reading for FakeNode {
-    type Message = SnarkosFullMessage;
+    type Message = Payload;
 
     fn read_message(
         &self,
@@ -228,20 +222,14 @@ impl Reading for FakeNode {
             let payload =
                 Payload::deserialize(&decrypted).map_err(|_| io::ErrorKind::InvalidData)?;
 
-            let full_message = SnarkosFullMessage { header, payload };
-
-            Ok(Some((full_message, MESSAGE_HEADER_LEN + payload_len)))
+            Ok(Some((payload, MESSAGE_HEADER_LEN + payload_len)))
         } else {
             Ok(None)
         }
     }
 
-    async fn process_message(
-        &self,
-        source: SocketAddr,
-        full_message: Self::Message,
-    ) -> io::Result<()> {
-        let named_response = match full_message.payload {
+    async fn process_message(&self, source: SocketAddr, payload: Self::Message) -> io::Result<()> {
+        let named_response = match payload {
             Payload::GetPeers => {
                 let peers = self
                     .peers
