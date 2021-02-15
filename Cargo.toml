@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 pea2pea = "0.17"
 snarkos-network = { git = "https://github.com/AleoHQ/snarkOS", branch = "staging" }
-snarkvm-objects = { git = "https://github.com/AleoHQ/snarkVM.git", rev = "a7e017b", version = "0.0.2" }
+snarkvm-objects = "0.0.3"
 
 async-trait = "0.1"
 bytes = "1"
