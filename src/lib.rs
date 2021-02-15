@@ -229,7 +229,7 @@ impl Reading for FakeNode {
     }
 
     async fn process_message(&self, source: SocketAddr, payload: Self::Message) -> io::Result<()> {
-        let named_response = match payload {
+        let response = match payload {
             Payload::GetPeers => {
                 let peers = self
                     .peers
@@ -242,9 +242,8 @@ impl Reading for FakeNode {
 
                 if !peers.is_empty() {
                     let peers = Payload::Peers(peers);
-                    let packet = prepare_packet(&peers);
 
-                    Some(("Peers", packet))
+                    Some(peers)
                 } else {
                     None
                 }
@@ -268,21 +267,19 @@ impl Reading for FakeNode {
 
                 None
             }
-            Payload::Ping(block_height) => {
-                let packet = prepare_packet(&Payload::Pong);
-
-                Some(("Pong", packet))
-            }
+            Payload::Ping(block_height) => Some(Payload::Pong),
             _ => None,
         };
 
-        if let Some((name, response)) = named_response {
+        if let Some(response) = response {
+            let packet = prepare_packet(&response);
+
             self.node()
-                .send_direct_message(source, response)
+                .send_direct_message(source, packet)
                 .await
                 .unwrap();
 
-            info!(parent: self.node().span(), "sent a {} to {}", name, source);
+            info!(parent: self.node().span(), "sent a {} to {}", response, source);
         }
 
         Ok(())
@@ -342,7 +339,7 @@ impl FakeNode {
 
                 if num_connected < self_clone.desired_connection_count as usize {
                     // broadcast GetPeers
-                    info!(parent: node.span(), "broadcasting GetPeers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
+                    info!(parent: node.span(), "broadcasting requests for peers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
 
                     let packeted = prepare_packet(&Payload::GetPeers);
                     node.send_broadcast(packeted).await.unwrap();
@@ -352,7 +349,7 @@ impl FakeNode {
 
                 if num_connected != 0 {
                     // broadcast Ping
-                    info!(parent: node.span(), "broadcasting Pings");
+                    info!(parent: node.span(), "broadcasting pings");
 
                     let packeted = prepare_packet(&Payload::Ping(
                         self_clone.current_block_height.load(Ordering::SeqCst),
