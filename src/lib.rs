@@ -14,7 +14,7 @@ use pea2pea::{
     protocols::{Handshaking, Reading, Writing},
     *,
 };
-use snarkos_network::external::*;
+use snarkos_network::{MessageHeader, Payload, Version};
 
 use std::{
     collections::{HashMap, HashSet},
