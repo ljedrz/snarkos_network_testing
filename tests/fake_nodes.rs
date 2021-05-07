@@ -114,10 +114,9 @@ async fn stress_test_snarkos_bootstrapper() {
     }
 
     for node in &fake_nodes {
-        node.node()
+        let _ = node.node()
             .connect("0.0.0.0:4141".parse().unwrap())
-            .await
-            .unwrap();
+            .await;
     }
 
     for node in &fake_nodes {

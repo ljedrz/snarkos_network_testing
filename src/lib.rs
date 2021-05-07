@@ -107,7 +107,7 @@ impl Handshaking for FakeNode {
 
                 // -> s, se, psk
                 let own_version =
-                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port()))
+                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port(), 0))
                         .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
@@ -142,7 +142,7 @@ impl Handshaking for FakeNode {
 
                 // -> e, ee, s, es
                 let own_version =
-                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port()))
+                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port(), 0))
                         .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
