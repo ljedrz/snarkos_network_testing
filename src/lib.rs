@@ -14,7 +14,7 @@ use pea2pea::{
     protocols::{Handshaking, Reading, Writing},
     *,
 };
-use snarkos_network::{MessageHeader, Payload, Version};
+use snarkos_network::{PROTOCOL_VERSION, MessageHeader, Payload, Version};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -107,7 +107,7 @@ impl Handshaking for FakeNode {
 
                 // -> s, se, psk
                 let own_version =
-                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port(), 0))
+                    Version::serialize(&Version::new(PROTOCOL_VERSION, conn.node.listening_addr().port(), 0))
                         .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
@@ -142,7 +142,7 @@ impl Handshaking for FakeNode {
 
                 // -> e, ee, s, es
                 let own_version =
-                    Version::serialize(&Version::new(1u64, conn.node.listening_addr().port(), 0))
+                    Version::serialize(&Version::new(PROTOCOL_VERSION, conn.node.listening_addr().port(), 0))
                         .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
@@ -229,6 +229,8 @@ impl Reading for FakeNode {
     }
 
     async fn process_message(&self, source: SocketAddr, payload: Self::Message) -> io::Result<()> {
+        info!(parent: self.node().span(), "got a {} from {}", payload, source);
+
         let response = match payload {
             Payload::GetPeers => {
                 let peers = self
@@ -266,6 +268,8 @@ impl Reading for FakeNode {
                 None
             }
             Payload::Ping(_block_height) => Some(Payload::Pong),
+            Payload::Sync(hashes) => Some(Payload::GetBlocks(hashes)),
+            Payload::SyncBlock(_block) => None,
             _ => None,
         };
 
@@ -344,11 +348,17 @@ impl FakeNode {
 
                 if num_connected != 0 {
                     // broadcast Ping
-                    info!(parent: node.span(), "broadcasting pings");
+                    info!(parent: node.span(), "broadcasting Ping");
 
                     let packeted = prepare_packet(&Payload::Ping(
                         self_clone.current_block_height.load(Ordering::SeqCst),
                     ));
+
+                    /*/ broadcast GetSync
+                    info!(parent: node.span(), "broadcasting GetSync");
+
+                    let packeted = prepare_packet(&Payload::GetSync(vec![]));
+                    */
                     let _ = node.send_broadcast(packeted).await;
                 }
             }
