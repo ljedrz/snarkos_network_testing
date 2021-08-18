@@ -23,7 +23,7 @@ fn start_logger() {
         .init();
 }
 
-async fn start_nodes(count: usize, config: Option<NodeConfig>) -> Vec<Node> {
+async fn start_nodes(count: usize, config: Option<Config>) -> Vec<Node> {
     let mut nodes = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -40,14 +40,14 @@ async fn pose_as_bootstrapper_with_peers() {
 
     const NUM_NON_BOOTSTRAPPERS: usize = 49;
 
-    let config = NodeConfig {
+    let config = Config {
         name: Some("bootstrapper".into()),
         desired_listening_port: Some(4141),
         ..Default::default()
     };
     let fake_bootstrapper = Node::new(Some(config)).await.unwrap();
 
-    let config = NodeConfig {
+    let config = Config {
         max_connections: DESIRED_CONNECTION_COUNT as u16 + 5,
         ..Default::default()
     };
@@ -97,7 +97,7 @@ async fn stress_test_snarkos_bootstrapper() {
 
     const NUM_FAKE_NODES: usize = 50;
 
-    let config = NodeConfig {
+    let config = Config {
         max_connections: DESIRED_CONNECTION_COUNT as u16 + 5,
         ..Default::default()
     };
@@ -114,9 +114,7 @@ async fn stress_test_snarkos_bootstrapper() {
     }
 
     for node in &fake_nodes {
-        let _ = node.node()
-            .connect("0.0.0.0:4141".parse().unwrap())
-            .await;
+        let _ = node.node().connect("0.0.0.0:4144".parse().unwrap()).await;
     }
 
     for node in &fake_nodes {
@@ -162,7 +160,7 @@ async fn single_plain_node() {
 async fn single_bootstrapper_node() {
     start_logger();
 
-    let config = NodeConfig {
+    let config = Config {
         name: Some("bootstrapper".into()),
         desired_listening_port: Some(4141),
         ..Default::default()

@@ -14,7 +14,7 @@ use pea2pea::{
     protocols::{Handshaking, Reading, Writing},
     *,
 };
-use snarkos_network::{PROTOCOL_VERSION, MessageHeader, Payload, Version};
+use snarkos_network::{MessageHeader, Payload, Version, PROTOCOL_VERSION};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -106,9 +106,12 @@ impl Handshaking for FakeNode {
                 trace!("received e, ee, s, es (XX handshake part 2/3)");
 
                 // -> s, se, psk
-                let own_version =
-                    Version::serialize(&Version::new(PROTOCOL_VERSION, conn.node.listening_addr().port(), 0))
-                        .unwrap();
+                let own_version = Version::serialize(&Version::new(
+                    PROTOCOL_VERSION,
+                    self.node().listening_addr().unwrap().port(),
+                    0,
+                ))
+                .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
                 conn.writer().write_all(&buffer[..len]).await?;
@@ -141,9 +144,12 @@ impl Handshaking for FakeNode {
                 trace!("received e (XX handshake part 1/3)");
 
                 // -> e, ee, s, es
-                let own_version =
-                    Version::serialize(&Version::new(PROTOCOL_VERSION, conn.node.listening_addr().port(), 0))
-                        .unwrap();
+                let own_version = Version::serialize(&Version::new(
+                    PROTOCOL_VERSION,
+                    self.node().listening_addr().unwrap().port(),
+                    0,
+                ))
+                .unwrap();
                 let len = noise.write_message(&own_version, &mut buffer).unwrap();
                 conn.writer().write_all(&[len as u8]).await?;
                 conn.writer().write_all(&buffer[..len]).await?;
@@ -180,52 +186,45 @@ impl Handshaking for FakeNode {
 impl Reading for FakeNode {
     type Message = Payload;
 
-    fn read_message(
+    fn read_message<R: io::Read>(
         &self,
         source: SocketAddr,
-        buffer: &[u8],
-    ) -> io::Result<Option<(Self::Message, usize)>> {
+        reader: &mut R,
+    ) -> io::Result<Option<Self::Message>> {
         // parse the header
         let mut header_arr = [0u8; MESSAGE_HEADER_LEN];
-        header_arr.copy_from_slice(&buffer[..MESSAGE_HEADER_LEN]);
+        reader.read_exact(&mut header_arr).unwrap();
         let header = MessageHeader::from(header_arr);
 
         // read payload length
         let payload_len = header.len as usize;
 
-        // re-slice the buffer, advancing it post-header for simplicity
-        let buffer = &buffer[MESSAGE_HEADER_LEN..];
-
         // the easy way
         let mut decrypted = vec![0u8; payload_len];
 
-        if buffer.len() >= payload_len {
-            let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
-            let noise = &mut *noise.lock();
+        let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
+        let noise = &mut *noise.lock();
 
-            let mut decrypted_len = 0;
-            let mut processed_len = 0;
+        let mut decrypted_len = 0;
+        let mut processed_len = 0;
 
-            while processed_len < payload_len {
-                let chunk_len =
-                    std::cmp::min(snarkos_network::NOISE_BUF_LEN, payload_len - processed_len);
-
-                decrypted_len += noise
-                    .read_message(
-                        &buffer[processed_len..][..chunk_len],
-                        &mut decrypted[decrypted_len..],
-                    )
-                    .map_err(|_| io::ErrorKind::InvalidData)?;
-                processed_len += chunk_len;
+        while processed_len < payload_len {
+            let chunk_len =
+                std::cmp::min(snarkos_network::NOISE_BUF_LEN, payload_len - processed_len);
+            let mut buffer = vec![0u8; chunk_len];
+            if reader.read_exact(&mut buffer).is_err() {
+                return Ok(None);
             }
 
-            let payload =
-                Payload::deserialize(&decrypted).map_err(|_| io::ErrorKind::InvalidData)?;
-
-            Ok(Some((payload, MESSAGE_HEADER_LEN + payload_len)))
-        } else {
-            Ok(None)
+            decrypted_len += noise
+                .read_message(&buffer, &mut decrypted[decrypted_len..])
+                .map_err(|_| io::ErrorKind::InvalidData)?;
+            processed_len += chunk_len;
         }
+
+        let payload = Payload::deserialize(&decrypted).map_err(|_| io::ErrorKind::InvalidData)?;
+
+        Ok(Some(payload))
     }
 
     async fn process_message(&self, source: SocketAddr, payload: Self::Message) -> io::Result<()> {
@@ -258,7 +257,7 @@ impl Reading for FakeNode {
                     let addr = peers
                         .iter()
                         .copied()
-                        .filter(|&addr| addr != self.node().listening_addr())
+                        .filter(|&addr| addr != self.node().listening_addr().unwrap())
                         .choose(&mut *RNG.lock())
                         .unwrap();
                     let _ = self.node().connect(addr).await;
@@ -276,7 +275,7 @@ impl Reading for FakeNode {
         if let Some(response) = response {
             let packet = prepare_packet(&response);
 
-            let _ = self.node().send_direct_message(source, packet).await;
+            let _ = self.node().send_direct_message(source, packet);
 
             info!(parent: self.node().span(), "sent a {} to {}", response, source);
         }
@@ -286,17 +285,16 @@ impl Reading for FakeNode {
 }
 
 impl Writing for FakeNode {
-    fn write_message(
+    fn write_message<W: io::Write>(
         &self,
         source: SocketAddr,
         payload: &[u8],
-        buffer: &mut [u8],
-    ) -> io::Result<usize> {
+        writer: &mut W,
+    ) -> io::Result<()> {
         let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
         let noise = &mut *noise.lock();
 
-        // make room for the length
-        buffer[..MESSAGE_HEADER_LEN].copy_from_slice(&[0, 0, 0, 0]);
+        let mut buffer = [0u8; snarkos_network::NOISE_BUF_LEN + snarkos_network::NOISE_TAG_LEN];
 
         let mut encrypted_len = MESSAGE_HEADER_LEN;
         let mut processed_len = 0;
@@ -318,7 +316,7 @@ impl Writing for FakeNode {
         let header = MessageHeader::from(encrypted_len);
         buffer[..MESSAGE_HEADER_LEN].copy_from_slice(&header.as_bytes()[..]);
 
-        Ok(MESSAGE_HEADER_LEN + encrypted_len)
+        writer.write_all(&buffer[..MESSAGE_HEADER_LEN + encrypted_len])
     }
 }
 
@@ -341,7 +339,7 @@ impl FakeNode {
                     info!(parent: node.span(), "broadcasting requests for peers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
 
                     let packeted = prepare_packet(&Payload::GetPeers);
-                    let _ = node.send_broadcast(packeted).await;
+                    let _ = node.send_broadcast(packeted);
                 } else {
                     trace!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
                 }
@@ -359,7 +357,7 @@ impl FakeNode {
 
                     let packeted = prepare_packet(&Payload::GetSync(vec![]));
                     */
-                    let _ = node.send_broadcast(packeted).await;
+                    let _ = node.send_broadcast(packeted);
                 }
             }
         });
