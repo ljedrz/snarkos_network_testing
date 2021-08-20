@@ -1,5 +1,5 @@
 use pea2pea::{
-    protocols::{Handshaking, Reading, Writing},
+    protocols::{Handshake, Reading, Writing},
     *,
 };
 use snarkos_network_testing::*;
@@ -58,7 +58,7 @@ async fn pose_as_bootstrapper_with_peers() {
         .collect::<Vec<_>>();
 
     for node in &fake_nodes {
-        node.enable_handshaking();
+        node.enable_handshake();
         node.enable_reading();
         node.enable_writing();
     }
@@ -108,7 +108,7 @@ async fn stress_test_snarkos_bootstrapper() {
         .collect::<Vec<_>>();
 
     for node in &fake_nodes {
-        node.enable_handshaking();
+        node.enable_handshake();
         node.enable_reading();
         node.enable_writing();
     }
@@ -142,7 +142,7 @@ async fn single_plain_node() {
     start_logger();
 
     let fake_node = FakeNode::from(Node::new(None).await.unwrap());
-    fake_node.enable_handshaking();
+    fake_node.enable_handshake();
     fake_node.enable_reading();
     fake_node.enable_writing();
     fake_node.run_periodic_maintenance();
@@ -166,7 +166,7 @@ async fn single_bootstrapper_node() {
         ..Default::default()
     };
     let fake_node = FakeNode::from(Node::new(Some(config)).await.unwrap());
-    fake_node.enable_handshaking();
+    fake_node.enable_handshake();
     fake_node.enable_reading();
     fake_node.enable_writing();
     fake_node.run_periodic_maintenance();

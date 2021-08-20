@@ -11,7 +11,7 @@ use tracing::*;
 
 use pea2pea::{
     connections::{Connection, ConnectionSide},
-    protocols::{Handshaking, Reading, Writing},
+    protocols::{Handshake, Reading, Writing},
     *,
 };
 use snarkos_network::{MessageHeader, Payload, Version, PROTOCOL_VERSION};
@@ -65,7 +65,7 @@ pub fn prepare_packet(payload: &Payload) -> Bytes {
 }
 
 #[async_trait::async_trait]
-impl Handshaking for FakeNode {
+impl Handshake for FakeNode {
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
         let mut locked_peers = self.peers.lock().await;
         // extra safeguard against double connections
@@ -273,11 +273,9 @@ impl Reading for FakeNode {
         };
 
         if let Some(response) = response {
-            let packet = prepare_packet(&response);
+            info!(parent: self.node().span(), "seding a {} to {}", response, source);
 
-            let _ = self.node().send_direct_message(source, packet);
-
-            info!(parent: self.node().span(), "sent a {} to {}", response, source);
+            let _ = self.send_direct_message(source, response);
         }
 
         Ok(())
@@ -285,10 +283,12 @@ impl Reading for FakeNode {
 }
 
 impl Writing for FakeNode {
+    type Message = Payload;
+
     fn write_message<W: io::Write>(
         &self,
         source: SocketAddr,
-        payload: &[u8],
+        payload: &Self::Message,
         writer: &mut W,
     ) -> io::Result<()> {
         let noise = Arc::clone(self.handshakes.read().get(&source).unwrap());
@@ -298,6 +298,8 @@ impl Writing for FakeNode {
 
         let mut encrypted_len = MESSAGE_HEADER_LEN;
         let mut processed_len = 0;
+
+        let payload = payload.serialize().unwrap();
 
         while processed_len < payload.len() {
             let chunk_len = std::cmp::min(
@@ -338,8 +340,7 @@ impl FakeNode {
                     // broadcast GetPeers
                     info!(parent: node.span(), "broadcasting requests for peers (I only have {}/{})", num_connected, self_clone.desired_connection_count);
 
-                    let packeted = prepare_packet(&Payload::GetPeers);
-                    let _ = node.send_broadcast(packeted);
+                    let _ = self_clone.send_broadcast(Payload::GetPeers);
                 } else {
                     trace!(parent: node.span(), "I don't need any more peers (I have {}/{})", num_connected, self_clone.desired_connection_count);
                 }
@@ -348,16 +349,15 @@ impl FakeNode {
                     // broadcast Ping
                     info!(parent: node.span(), "broadcasting Ping");
 
-                    let packeted = prepare_packet(&Payload::Ping(
-                        self_clone.current_block_height.load(Ordering::SeqCst),
-                    ));
+                    let message =
+                        Payload::Ping(self_clone.current_block_height.load(Ordering::SeqCst));
 
                     /*/ broadcast GetSync
                     info!(parent: node.span(), "broadcasting GetSync");
 
                     let packeted = prepare_packet(&Payload::GetSync(vec![]));
                     */
-                    let _ = node.send_broadcast(packeted);
+                    let _ = self_clone.send_broadcast(message);
                 }
             }
         });
